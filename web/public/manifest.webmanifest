@@ -1,0 +1,20 @@
+{
+  "name": "PurrCam — Cat Video Monitor",
+  "short_name": "PurrCam",
+  "description": "Material 3 Expressive cat monitor with remote Poco F3 lens switching, live telemetry, and 4G/5G tunnel access",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#141218",
+  "theme_color": "#141218",
+  "lang": "en",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

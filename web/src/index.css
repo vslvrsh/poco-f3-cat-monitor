@@ -1,0 +1,231 @@
+@import "tailwindcss";
+
+:root,
+[data-m3-seed="lavender"] {
+  --md-sys-color-surface: #141218;
+  --md-sys-color-surface-container-lowest: #0F0D13;
+  --md-sys-color-surface-container-low: #1D1B20;
+  --md-sys-color-surface-container: #211F26;
+  --md-sys-color-surface-container-high: #2B2930;
+  --md-sys-color-surface-container-highest: #36343B;
+  --md-sys-color-on-surface: #E6E0E9;
+  --md-sys-color-on-surface-variant: #CAC4D0;
+
+  --md-sys-color-primary: #D0BCFF;
+  --md-sys-color-on-primary: #381E72;
+  --md-sys-color-primary-container: #4F378B;
+  --md-sys-color-on-primary-container: #EADDFF;
+
+  --md-sys-color-secondary: #CCC2DC;
+  --md-sys-color-on-secondary: #332D41;
+  --md-sys-color-secondary-container: #4A4458;
+  --md-sys-color-on-secondary-container: #E8DEF8;
+
+  --md-sys-color-tertiary: #EFB8C8;
+  --md-sys-color-on-tertiary: #492532;
+  --md-sys-color-tertiary-container: #633B48;
+  --md-sys-color-on-tertiary-container: #FFD8E4;
+
+  --md-sys-color-live: #7DD3A8;
+  --md-sys-color-on-live: #08291B;
+  --md-sys-color-live-container: #18382B;
+  --md-sys-color-on-live-container: #C2F0D8;
+
+  --md-sys-color-warn: #FFB951;
+  --md-sys-color-warn-container: #4D3511;
+  --md-sys-color-on-warn-container: #FFDDB3;
+
+  --md-sys-color-error: #F2B8B5;
+  --md-sys-color-on-error: #601410;
+  --md-sys-color-error-container: #8C1D18;
+  --md-sys-color-on-error-container: #F9DEDC;
+}
+
+[data-m3-seed="amber"] {
+  --md-sys-color-surface: #17130E;
+  --md-sys-color-surface-container-lowest: #120E09;
+  --md-sys-color-surface-container-low: #201B16;
+  --md-sys-color-surface-container: #241F1A;
+  --md-sys-color-surface-container-high: #2F2924;
+  --md-sys-color-surface-container-highest: #3A342E;
+  --md-sys-color-on-surface: #ECE0D9;
+  --md-sys-color-on-surface-variant: #D3C4B4;
+
+  --md-sys-color-primary: #FFB951;
+  --md-sys-color-on-primary: #452B00;
+  --md-sys-color-primary-container: #633F00;
+  --md-sys-color-on-primary-container: #FFDDB3;
+
+  --md-sys-color-secondary: #DFC2A2;
+  --md-sys-color-on-secondary: #3F2D17;
+  --md-sys-color-secondary-container: #57432B;
+  --md-sys-color-on-secondary-container: #FCDEBC;
+
+  --md-sys-color-tertiary: #BBD0A6;
+  --md-sys-color-on-tertiary: #273719;
+  --md-sys-color-tertiary-container: #3D4E2E;
+  --md-sys-color-on-tertiary-container: #D7ECBF;
+}
+
+[data-m3-seed="emerald"] {
+  --md-sys-color-surface: #101512;
+  --md-sys-color-surface-container-lowest: #0B0F0D;
+  --md-sys-color-surface-container-low: #181D1A;
+  --md-sys-color-surface-container: #1C211E;
+  --md-sys-color-surface-container-high: #262B28;
+  --md-sys-color-surface-container-highest: #313633;
+  --md-sys-color-on-surface: #E0E4DF;
+  --md-sys-color-on-surface-variant: #C0C9C1;
+
+  --md-sys-color-primary: #83D6B1;
+  --md-sys-color-on-primary: #003826;
+  --md-sys-color-primary-container: #005139;
+  --md-sys-color-on-primary-container: #9FF2CC;
+
+  --md-sys-color-secondary: #B4CCBE;
+  --md-sys-color-on-secondary: #20352B;
+  --md-sys-color-secondary-container: #364B41;
+  --md-sys-color-on-secondary-container: #D0E8D9;
+
+  --md-sys-color-tertiary: #A6CCE0;
+  --md-sys-color-on-tertiary: #0A3545;
+  --md-sys-color-tertiary-container: #254B5C;
+  --md-sys-color-on-tertiary-container: #C2E8FD;
+}
+
+[data-m3-seed="ocean"] {
+  --md-sys-color-surface: #10131A;
+  --md-sys-color-surface-container-lowest: #0B0E14;
+  --md-sys-color-surface-container-low: #181C22;
+  --md-sys-color-surface-container: #1C2026;
+  --md-sys-color-surface-container-high: #272A31;
+  --md-sys-color-surface-container-highest: #32353C;
+  --md-sys-color-on-surface: #E1E2E9;
+  --md-sys-color-on-surface-variant: #C2C6D2;
+
+  --md-sys-color-primary: #A8C7FA;
+  --md-sys-color-on-primary: #0A305F;
+  --md-sys-color-primary-container: #274777;
+  --md-sys-color-on-primary-container: #D6E3FF;
+
+  --md-sys-color-secondary: #BDC7DC;
+  --md-sys-color-on-secondary: #273141;
+  --md-sys-color-secondary-container: #3E4758;
+  --md-sys-color-on-secondary-container: #D9E3F8;
+
+  --md-sys-color-tertiary: #DCBCE0;
+  --md-sys-color-on-tertiary: #3E2844;
+  --md-sys-color-tertiary-container: #563E5C;
+  --md-sys-color-on-tertiary-container: #F9D8FD;
+}
+
+@theme {
+  --font-sans: "Google Sans", "Plus Jakarta Sans", "Inter", "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    background-color: var(--md-sys-color-surface);
+    color: var(--md-sys-color-on-surface);
+    font-family: var(--font-sans);
+    overflow-x: hidden;
+    transition: background-color 240ms ease, color 200ms ease;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Signature Material 3 Expressive Spring & Shape-Morphing Physics */
+.m3-spring {
+  transition:
+    border-radius 320ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    transform 280ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    background-color 200ms ease,
+    color 200ms ease,
+    width 280ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    height 280ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 220ms ease,
+    opacity 200ms ease;
+}
+
+.m3-spring:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+/* Pill-to-Squircle morphing helper: 999px capsule when idle, 18px squircle when active/pressed */
+.m3-morph-pill {
+  border-radius: 9999px;
+  transition:
+    border-radius 320ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    transform 280ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    background-color 200ms ease,
+    color 200ms ease,
+    box-shadow 220ms ease;
+}
+
+.m3-morph-pill[data-active="true"],
+.m3-morph-pill:active:not(:disabled) {
+  border-radius: 18px;
+}
+
+.m3-morph-pill:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+/* Subtle M3 Tonal Scrollbars */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--md-sys-color-surface-container-highest);
+  border-radius: 999px;
+}
+
+@keyframes pulseRing {
+  0% {
+    transform: scale(0.95);
+    opacity: 0.75;
+  }
+  70% {
+    transform: scale(1.85);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1.85);
+    opacity: 0;
+  }
+}
+
+.live-pulse::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: var(--md-sys-color-live);
+  animation: pulseRing 2.1s cubic-bezier(0.24, 0, 0.38, 1) infinite;
+}
+
+@keyframes talkWave {
+  0%, 100% {
+    transform: scaleY(0.35);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+.talk-bar-1 { animation: talkWave 0.62s ease-in-out infinite; }
+.talk-bar-2 { animation: talkWave 0.48s ease-in-out 0.12s infinite; }
+.talk-bar-3 { animation: talkWave 0.68s ease-in-out 0.24s infinite; }

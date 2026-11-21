@@ -1,0 +1,41 @@
+# OS & Editors
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/
+
+# Server & Desktop Launcher
+server/data/
+server/bin/
+server/dist/
+server/node_modules/
+server/desktop-launcher/BuildConfig.cs
+
+# Web Frontend
+web/dist/
+web/node_modules/
+.vite/
+
+# Android / Gradle
+android/local.properties
+android/.gradle/
+android/app/build/
+android/build/
+android/captures/
+*.iml
+*.keystore
+*.jks
+*.apk
+*.aab
+
+# Binaries, Release Bundles, Scratch & Secrets
+PurrCam.exe
+*.exe
+release-artifacts/
+scratch/
+*.log
+npm-debug.log*
+.env
+.env.*

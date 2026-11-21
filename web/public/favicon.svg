@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <radialGradient id="eyeGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FDE68A" />
+      <stop offset="55%" stop-color="#F59E0B" />
+      <stop offset="100%" stop-color="#B45309" />
+    </radialGradient>
+    <radialGradient id="bgGlow" cx="50%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#171C26" />
+      <stop offset="100%" stop-color="#06070A" />
+    </radialGradient>
+  </defs>
+  <rect width="128" height="128" rx="30" fill="url(#bgGlow)" />
+  <rect x="3" y="3" width="122" height="122" rx="27" stroke="#1E2430" stroke-width="2" />
+  <!-- Subtle cat ears silhouette -->
+  <path d="M28 52L34 24L54 40C60 38 68 38 74 40L94 24L100 52" stroke="#2D3648" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+  <!-- Almond cat eye -->
+  <path d="M22 68C34 46 50 40 64 40C78 40 94 46 106 68C94 90 78 96 64 96C50 96 34 90 22 68Z" fill="url(#eyeGlow)" />
+  <!-- Vertical slit pupil -->
+  <path d="M64 46C69.5 55 70.5 79 64 90C57.5 79 58.5 55 64 46Z" fill="#06070A" />
+  <!-- Specular catchlight -->
+  <circle cx="53" cy="57" r="4.5" fill="#FFFBEB" fill-opacity="0.9" />
+  <circle cx="75" cy="77" r="2.2" fill="#FEF3C7" fill-opacity="0.5" />
+  <!-- Live emerald indicator dot -->
+  <circle cx="101" cy="27" r="7" fill="#10B981" />
+  <circle cx="101" cy="27" r="7" stroke="#06070A" stroke-width="2.5" />
+</svg>

@@ -1,0 +1,28 @@
+{
+  "name": "purrcam-server",
+  "version": "1.1.0",
+  "description": "PurrCam PC Backend, WebRTC Signaling Hub, Telemetry & Snapshot Server",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsc -p tsconfig.json && node --watch dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "build:exe": "node desktop-launcher/build-exe.mjs",
+    "package:win": "tsc -p tsconfig.json && node desktop-launcher/package-release.mjs",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc -p tsconfig.json && node --test test/server.test.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
