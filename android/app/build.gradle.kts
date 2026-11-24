@@ -13,8 +13,8 @@ android {
         applicationId = "com.purrcam.app"
         minSdk = 28
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.1.1"
     }
 
     val releaseKeystorePath = (project.findProperty("PURRCAM_KEYSTORE_PATH") as? String)

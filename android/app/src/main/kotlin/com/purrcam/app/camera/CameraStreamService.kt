@@ -22,6 +22,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.purrcam.app.MainActivity
+import com.purrcam.app.R
 import com.purrcam.app.data.AppPreferences
 import com.purrcam.app.monitor.BeaconResolver
 import com.purrcam.app.protocol.CameraCapabilities
@@ -1179,7 +1180,7 @@ class CameraStreamService : Service() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setSmallIcon(R.drawable.ic_stat_purrcam)
             .setContentTitle("PurrCam · Camera Active")
             .setContentText(text)
             .setOngoing(true)

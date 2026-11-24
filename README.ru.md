@@ -19,7 +19,7 @@
 ## Возможности
 
 - **Один APK для обоих телефонов (Режим камеры + Режим монитора)**
-  Установите одно приложение в стиле **Material 3 Expressive** (Dynamic Color на Android 12+, удобные вкладки, пинч-зум, обратная голосовая связь, сохранение фото в Галерею) и на **Poco F3** (Камера), и на **основной смартфон** (Монитор).
+  Установите одно приложение в стиле **Material 3 Expressive** (Dynamic Color на Android 12+, минималистичная иконка **Material You Themed Icons** со слоем `<monochrome>`, удобные вкладки, пинч-зум, обратная голосовая связь, сохранение фото в Галерею) и на **Poco F3** (Камера), и на **основной смартфон** (Монитор).
 - **Настоящий ширик `0.6×` на Poco F3 / Xiaomi через Camera2**
   Вместо стандартного WebRTC-перечислителя используется собственный движок Camera2, напрямую опрашивающий вспомогательные (aux) ID и физические камеры (`physicalCameraIds`) с классификацией по **35-мм эквиваленту фокусного расстояния** (`36 × f / sensorWidth`). Доступно мгновенное переключение **`0.6× Wide` (ширик)**, **`1× Main`**, **`Macro`** и **`Front`** прямо во время стрима без разрыва WebRTC.
 - **Защита AMOLED-экрана 24/7 и опциональный Root-контроль**
@@ -37,15 +37,15 @@
 
 ## Быстрая установка (из GitHub Releases)
 
-### 1. ПК-сервер для Windows (`PurrCam-Windows-v1.1.0.zip`)
+### 1. ПК-сервер для Windows (`PurrCam-Windows-v1.1.1.zip`)
 > **Требование**: установленный [Node.js 20+](https://nodejs.org/).
 
-1. Скачайте архив [**`PurrCam-Windows-v1.1.0.zip`**](https://github.com/vslvrsh/poco-f3-cat-monitor/releases/latest/download/PurrCam-Windows-v1.1.0.zip) и распакуйте в любую папку (например, `C:\PurrCam`).
+1. Скачайте архив [**`PurrCam-Windows-v1.1.1.zip`**](https://github.com/vslvrsh/poco-f3-cat-monitor/releases/latest/download/PurrCam-Windows-v1.1.1.zip) и распакуйте в любую папку (например, `C:\PurrCam`).
 2. Запустите **`PurrCam.exe`** — сервер поднимется на порту `8787`, включит защиту ПК от сна, добавит значок в трей и автоматически откроет окно монитора.
 3. *(Опционально)* Скрипт `server\start-remote.cmd` сразу запускает сервер вместе с удалённым доступом `Auto (No VPN)`.
 
-### 2. Android-приложение (`PurrCam-Android-v1.1.0.apk`)
-1. Скачайте [**`PurrCam-Android-v1.1.0.apk`**](https://github.com/vslvrsh/poco-f3-cat-monitor/releases/latest/download/PurrCam-Android-v1.1.0.apk) и установите:
+### 2. Android-приложение (`PurrCam-Android-v1.1.1.apk`)
+1. Скачайте [**`PurrCam-Android-v1.1.1.apk`**](https://github.com/vslvrsh/poco-f3-cat-monitor/releases/latest/download/PurrCam-Android-v1.1.1.apk) и установите:
    - на **Poco F3** (или любой Android 9+) → выберите **Camera Mode**;
    - на **основной телефон** → выберите **Monitor Mode**.
 2. Выдайте разрешения на **Камеру**, **Микрофон** и **Уведомления**, а на телефоне-камере разрешите работу без ограничений батареи (при наличии KernelSU root добавляется в белый список автоматически).
