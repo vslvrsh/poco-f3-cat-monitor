@@ -1,5 +1,8 @@
 package com.purrcam.app
 
+import com.purrcam.app.camera.RelayFrameEncoder
+import com.purrcam.app.monitor.BeaconPayload
+import com.purrcam.app.monitor.BeaconResolver
 import com.purrcam.app.protocol.CameraCapabilities
 import com.purrcam.app.protocol.CameraState
 import com.purrcam.app.protocol.CommandAckMsg
@@ -9,8 +12,10 @@ import com.purrcam.app.protocol.PairingLinkParser
 import com.purrcam.app.protocol.PurrJson
 import com.purrcam.app.protocol.RegisterCameraMsg
 import com.purrcam.app.protocol.ServerUrlHelper
+import com.purrcam.app.protocol.StreamModeMsg
 import com.purrcam.app.protocol.Telemetry
 import com.purrcam.app.protocol.TelemetryMsg
+import com.purrcam.app.protocol.VideoFrameMsg
 import com.purrcam.app.root.RootPowerController
 import kotlinx.serialization.encodeToString
 import org.junit.Assert.assertEquals
@@ -19,6 +24,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Base64
 
 class ProtocolTest {
     @Test
@@ -168,5 +174,76 @@ class ProtocolTest {
         assertTrue(RootPowerController.isAllowedChargeNode("/sys/class/power_supply/battery/input_suspend"))
         assertFalse(RootPowerController.isAllowedChargeNode("/sys/class/power_supply/battery/input_suspend;id"))
         assertFalse(RootPowerController.isAllowedChargeNode("/data/local/tmp/evil"))
+    }
+
+    @Test
+    fun encryptedBeaconMatchesProtocolV12InteropTestVector() {
+        val token = "purrcam-test-vector-token-v1"
+        val expectedTopic = "purrcam-a793ba5e2ec528be44b8c7169f47de2d"
+        assertEquals(expectedTopic, BeaconResolver.deriveTopicId(token))
+
+        val specEnvelope = """{"v":1,"iv":"AQIDBAUGBwgJCgsM","ct":"makxxxrVCdpbHF1dzommR5+Bzaej6iOtNkMXQzrV0M8Rgtkosyq7lOK1ENcS18T4qFASC4aWlqgXvNNv/cyS7kehKARzrygL4Fdu/b0HxJ7nj1zD7fNvMU7rPhbiZOX6RgDBFhtvuWTJgYOkeCnxTs0Rr/OVmB2OnsMgzWlESBdP2lBL/l5/Onl7sEk="}"""
+        val decrypted = BeaconResolver.decryptEnvelope(token, specEnvelope)
+        assertNotNull(decrypted)
+        assertEquals("https://demo.app.lhr.life", decrypted!!.url)
+        assertEquals("wss://demo.app.lhr.life/ws", decrypted.wsUrl)
+        assertEquals("localhost.run", decrypted.provider)
+        assertEquals(1795500000000L, decrypted.ts)
+
+        // Wrong token must fail AES-GCM authentication
+        assertNull(BeaconResolver.decryptEnvelope("wrong-token", specEnvelope))
+
+        // Re-encrypting with exact same IV produces byte-for-byte identical envelope
+        val iv = Base64.getDecoder().decode("AQIDBAUGBwgJCgsM")
+        val reEncrypted = BeaconResolver.encryptEnvelope(token, decrypted, iv)
+        assertEquals(specEnvelope, reEncrypted)
+
+        // NDJSON polling picks highest timestamp across multiple entries
+        val newer = BeaconPayload(
+            v = 1,
+            url = "https://newer.app.lhr.life",
+            wsUrl = "wss://newer.app.lhr.life/ws",
+            provider = "pinggy",
+            ts = 1795500099000L
+        )
+        val newerEnv = BeaconResolver.encryptEnvelope(token, newer)
+        val ndjson = buildString {
+            appendLine("""{"id":"1","event":"open"}""")
+            appendLine("""{"id":"2","event":"message","message":${PurrJson.encodeToString(specEnvelope)}}""")
+            appendLine("""{"id":"3","event":"message","message":${PurrJson.encodeToString(newerEnv)}}""")
+        }
+        val parsedList = BeaconResolver.parseNtfyNdjson(token, ndjson)
+        assertEquals(2, parsedList.size)
+        assertEquals("wss://newer.app.lhr.life/ws", parsedList.maxBy { it.ts }.wsUrl)
+    }
+
+    @Test
+    fun relayFrameEncoderDimensionsAndRotationsAreUpright() {
+        // 1280x720 rotated 90 deg -> portrait 540x960 (max short edge 540)
+        assertEquals(540 to 960, RelayFrameEncoder.computeOutputDimensions(1280, 720, 90))
+        assertEquals(540 to 960, RelayFrameEncoder.computeOutputDimensions(1280, 720, 270))
+        assertEquals(960 to 540, RelayFrameEncoder.computeOutputDimensions(1280, 720, 0))
+        assertEquals(960 to 540, RelayFrameEncoder.computeOutputDimensions(1280, 720, 180))
+
+        // Verify 90 deg clockwise corner mapping: dst(0,0) <- src(0, srcH-1)
+        val p90TopLeft = RelayFrameEncoder.mapDestToSource(0, 0, 540, 960, 1280, 720, 90)
+        assertEquals(0, (p90TopLeft ushr 16) and 0xFFFF)
+        assertTrue((p90TopLeft and 0xFFFF) >= 718)
+
+        // Verify 270 deg (front camera) corner mapping: dst(0,0) <- src(srcW-1, 0)
+        val p270TopLeft = RelayFrameEncoder.mapDestToSource(0, 0, 540, 960, 1280, 720, 270)
+        assertTrue(((p270TopLeft ushr 16) and 0xFFFF) >= 1278)
+        assertEquals(0, p270TopLeft and 0xFFFF)
+
+        // Verify Protocol v1.2 ws_relay frame serialization
+        val sm = PurrJson.encodeToString(StreamModeMsg(viewerId = "v1", mode = "ws_relay", fps = 8, quality = 60))
+        assertTrue(sm.contains("\"type\":\"stream_mode\""))
+        assertTrue(sm.contains("\"mode\":\"ws_relay\""))
+
+        val vf = PurrJson.encodeToString(
+            VideoFrameMsg(ts = 123L, width = 540, height = 960, lensLabel = "0.6× Wide", data = "AAAA")
+        )
+        assertTrue(vf.contains("\"type\":\"video_frame\""))
+        assertTrue(vf.contains("\"mime\":\"image/jpeg\""))
     }
 }

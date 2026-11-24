@@ -16,6 +16,7 @@ import {
   Link2,
   Loader2,
   Plus,
+  Radio,
   RefreshCw,
   Server,
   ShieldCheck,
@@ -27,6 +28,7 @@ import {
 import type {
   IceServerConfig,
   RemoteConfig,
+  RemoteProvider,
   RemoteTunnelStatus,
   ServerInfo,
   WsConnectionStatus,
@@ -54,10 +56,39 @@ interface ConnectViewProps {
   liveRemoteStatus: RemoteTunnelStatus | null;
   onRemoteStatusChange: (status: RemoteTunnelStatus | null) => void;
   onApplyConfig: (next: ConnectionConfig) => void;
+  onDiscoverBeacon: () => Promise<boolean>;
   onNotify: (tone: 'info' | 'success' | 'warning' | 'error', message: string) => void;
 }
 
 type QrTab = 'remote' | 'local' | 'usb';
+type SelectableProvider = 'auto' | 'localhost.run' | 'pinggy' | 'cloudflare' | 'custom';
+
+const PROVIDER_OPTIONS: { value: SelectableProvider; label: string }[] = [
+  { value: 'auto', label: 'Auto (No VPN)' },
+  { value: 'localhost.run', label: 'localhost.run' },
+  { value: 'pinggy', label: 'Pinggy :443' },
+  { value: 'cloudflare', label: 'Cloudflare HTTP/2' },
+  { value: 'custom', label: 'Custom' },
+];
+
+function formatProviderName(provider?: string): string {
+  switch (provider) {
+    case 'localhost.run':
+      return 'localhost.run';
+    case 'pinggy':
+      return 'Pinggy :443';
+    case 'cloudflare':
+      return 'Cloudflare HTTP/2';
+    case 'tailscale':
+      return 'Tailscale';
+    case 'custom':
+      return 'Custom HTTPS';
+    case 'auto':
+      return 'Auto (No VPN)';
+    default:
+      return provider || 'None';
+  }
+}
 
 interface TurnRow {
   id: string;
@@ -92,6 +123,7 @@ export function ConnectView({
   liveRemoteStatus,
   onRemoteStatusChange,
   onApplyConfig,
+  onDiscoverBeacon,
   onNotify,
 }: ConnectViewProps) {
   const [info, setInfo] = useState<ServerInfo | null>(null);
@@ -110,7 +142,10 @@ export function ConnectView({
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  // Access token & auto-start editor
+  // Access token, tunnel provider & auto-start editor
+  const [selectedProvider, setSelectedProvider] = useState<SelectableProvider>('auto');
+  const [draftCustomRemoteUrl, setDraftCustomRemoteUrl] = useState('');
+  const [beaconSearching, setBeaconSearching] = useState(false);
   const [showToken, setShowToken] = useState(false);
   const [draftAccessToken, setDraftAccessToken] = useState('');
   const [draftAutoStart, setDraftAutoStart] = useState(false);
@@ -179,6 +214,9 @@ export function ConnectView({
         setLocalAdminForbidden(false);
         setDraftAccessToken(cfg.token ?? '');
         setDraftAutoStart(Boolean(cfg.autoStartTunnel));
+        if (cfg.customRemoteUrl) {
+          setDraftCustomRemoteUrl(cfg.customRemoteUrl);
+        }
         hydrateTurnRows(Array.isArray(cfg.iceServers) ? cfg.iceServers : []);
       } catch (err) {
         setRemoteCfgUnavailable(true);
@@ -329,17 +367,31 @@ export function ConnectView({
         onNotify('info', 'Remote tunnel stopped');
         await loadAll();
       } else {
-        onNotify('info', 'Starting Cloudflare remote tunnel…');
+        const provider: RemoteProvider = selectedProvider;
+        if (provider === 'custom' && !isSafeHttpUrl(draftCustomRemoteUrl)) {
+          onNotify('warning', 'Enter a valid https:// custom URL first');
+          return;
+        }
+        onNotify(
+          'info',
+          provider === 'auto'
+            ? 'Starting VPN-free remote tunnel (Auto)…'
+            : `Starting ${formatProviderName(provider)} tunnel…`
+        );
         const res = await startRemoteTunnel(
           config.serverUrl,
-          { provider: 'cloudflare' },
+          {
+            provider,
+            ...(provider === 'custom' ? { customUrl: draftCustomRemoteUrl.trim() } : {}),
+          },
           config.token
         );
         onRemoteStatusChange(res.remote);
         if (res.token && !config.token) {
           onApplyConfig({ serverUrl: config.serverUrl, token: res.token });
         }
-        onNotify('success', 'Remote 4G/5G tunnel is live');
+        const activeName = formatProviderName(res.remote.activeProvider ?? res.remote.provider);
+        onNotify('success', `Remote tunnel live via ${activeName}`);
         await loadAll();
       }
     } catch (err) {
@@ -464,6 +516,15 @@ export function ConnectView({
     });
   };
 
+  const activeBackendProvider =
+    remoteStatus.activeProvider && remoteStatus.activeProvider !== 'none'
+      ? remoteStatus.activeProvider
+      : remoteStatus.provider && remoteStatus.provider !== 'none' && remoteStatus.provider !== 'auto'
+        ? remoteStatus.provider
+        : null;
+  const beaconActive = Boolean(
+    isTunnelRunning && (remoteStatus.beacon ? remoteStatus.beacon.enabled : true)
+  );
   const adbCommand = `adb reverse tcp:${activePort} tcp:${activePort}`;
   const turnConfigured = Boolean(info?.turnConfigured || turnRows.some((r) => r.url.trim()));
 
@@ -571,44 +632,57 @@ export function ConnectView({
                     style={{ color: 'var(--md-sys-color-on-surface)' }}
                     className="text-base font-semibold"
                   >
-                    Remote Access (4G / 5G)
+                    Remote Access (No VPN · Zero Signup)
                   </h2>
                   <p
                     style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
                     className="text-xs"
                   >
-                    Cloudflare HTTPS/WSS tunnel outside your home Wi-Fi
+                    1-click HTTPS/WSS tunnel &amp; encrypted Auto-Sync Beacon for 4G/5G
                   </p>
                 </div>
               </div>
 
-              <span
-                style={{
-                  backgroundColor: isTunnelRunning
-                    ? 'var(--md-sys-color-live-container)'
+              <div className="flex flex-wrap items-center gap-1.5">
+                {isTunnelRunning && activeBackendProvider && (
+                  <span
+                    style={{
+                      backgroundColor: 'var(--md-sys-color-secondary-container)',
+                      color: 'var(--md-sys-color-on-secondary-container)',
+                    }}
+                    className="rounded-full px-3 py-1 font-mono text-[11px] font-semibold"
+                  >
+                    via {formatProviderName(activeBackendProvider)}
+                  </span>
+                )}
+                <span
+                  style={{
+                    backgroundColor: isTunnelRunning
+                      ? 'var(--md-sys-color-live-container)'
+                      : isTunnelStarting
+                        ? 'var(--md-sys-color-warn-container)'
+                        : remoteStatus.status === 'error'
+                          ? 'var(--md-sys-color-error-container)'
+                          : 'var(--md-sys-color-surface-container-high)',
+                    color: isTunnelRunning
+                      ? 'var(--md-sys-color-on-live-container)'
+                      : isTunnelStarting
+                        ? 'var(--md-sys-color-on-warn-container)'
+                        : remoteStatus.status === 'error'
+                          ? 'var(--md-sys-color-on-error-container)'
+                          : 'var(--md-sys-color-on-surface-variant)',
+                  }}
+                  className="rounded-full px-3 py-1 text-xs font-semibold"
+                >
+                  {isTunnelRunning
+                    ? 'Live'
                     : isTunnelStarting
-                      ? 'var(--md-sys-color-warn-container)'
+                      ? 'Starting…'
                       : remoteStatus.status === 'error'
-                        ? 'var(--md-sys-color-error-container)'
-                        : 'var(--md-sys-color-surface-container-high)',
-                  color: isTunnelRunning
-                    ? 'var(--md-sys-color-on-live-container)'
-                    : isTunnelStarting
-                      ? 'var(--md-sys-color-on-warn-container)'
-                      : remoteStatus.status === 'error'
-                        ? 'var(--md-sys-color-on-error-container)'
-                        : 'var(--md-sys-color-on-surface-variant)',
-                }}
-                className="rounded-full px-3 py-1 text-xs font-semibold"
-              >
-                {isTunnelRunning
-                  ? 'Live'
-                  : isTunnelStarting
-                    ? 'Starting…'
-                    : remoteStatus.status === 'error'
-                      ? 'Error'
-                      : 'Stopped'}
-              </span>
+                        ? 'Error'
+                        : 'Stopped'}
+                </span>
+              </div>
             </div>
 
             {remoteStatus.error && (
@@ -620,6 +694,52 @@ export function ConnectView({
                 className="mb-4 rounded-[20px] px-4 py-3 text-xs"
               >
                 {remoteStatus.error}
+              </div>
+            )}
+
+            {/* Tunnel Provider Selector (Default: Auto · No VPN · Zero Signup) */}
+            {!remoteCfgUnavailable && (
+              <div className="mb-4 space-y-2.5">
+                <div className="flex flex-wrap gap-1.5">
+                  {PROVIDER_OPTIONS.map((opt) => {
+                    const active = selectedProvider === opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        data-active={active}
+                        disabled={tunnelBusy || isTunnelRunning || isTunnelStarting}
+                        onClick={() => setSelectedProvider(opt.value)}
+                        style={{
+                          backgroundColor: active
+                            ? 'var(--md-sys-color-secondary-container)'
+                            : 'var(--md-sys-color-surface-container-high)',
+                          color: active
+                            ? 'var(--md-sys-color-on-secondary-container)'
+                            : 'var(--md-sys-color-on-surface-variant)',
+                        }}
+                        className="m3-morph-pill px-3.5 py-1.5 text-xs font-semibold disabled:opacity-50"
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {selectedProvider === 'custom' && (
+                  <input
+                    type="text"
+                    value={draftCustomRemoteUrl}
+                    disabled={isTunnelRunning || isTunnelStarting}
+                    onChange={(e) => setDraftCustomRemoteUrl(e.target.value)}
+                    placeholder="https://purrcam.example.com"
+                    style={{
+                      backgroundColor: 'var(--md-sys-color-surface-container-low)',
+                      color: 'var(--md-sys-color-on-surface)',
+                    }}
+                    className="w-full rounded-full px-4 py-2 font-mono text-xs outline-none disabled:opacity-50"
+                  />
+                )}
               </div>
             )}
 
@@ -651,8 +771,10 @@ export function ConnectView({
                   {isTunnelRunning
                     ? 'Stop Tunnel'
                     : isTunnelStarting
-                      ? 'Starting Cloudflare Tunnel…'
-                      : 'Start Remote Tunnel (Cloudflare)'}
+                      ? 'Starting VPN-Free Tunnel…'
+                      : selectedProvider === 'auto'
+                        ? 'Start Remote Tunnel (Auto · No VPN)'
+                        : `Start ${formatProviderName(selectedProvider)} Tunnel`}
                 </span>
               </button>
 
@@ -673,11 +795,11 @@ export function ConnectView({
               )}
             </div>
 
-            {/* Live Tunnel URL Readout */}
+            {/* Live Tunnel URL Readout + Auto-Sync Beacon Pill */}
             {isTunnelRunning && remoteStatus.url && (
               <div
                 style={{ backgroundColor: 'var(--md-sys-color-surface-container-low)' }}
-                className="mt-4 space-y-2 rounded-[22px] p-4"
+                className="mt-4 space-y-3 rounded-[22px] p-4"
               >
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0">
@@ -686,6 +808,9 @@ export function ConnectView({
                       className="text-[11px]"
                     >
                       Remote HTTPS URL
+                      {activeBackendProvider
+                        ? ` (${formatProviderName(activeBackendProvider)})`
+                        : ''}
                     </div>
                     <div
                       style={{ color: 'var(--md-sys-color-live)' }}
@@ -716,6 +841,28 @@ export function ConnectView({
                     <span>Copy Link</span>
                   </button>
                 </div>
+
+                {beaconActive && (
+                  <div
+                    style={{
+                      backgroundColor: 'var(--md-sys-color-live-container)',
+                      color: 'var(--md-sys-color-on-live-container)',
+                    }}
+                    className="flex flex-col gap-1 rounded-[18px] px-3.5 py-2.5"
+                  >
+                    <div className="flex items-center gap-2 text-xs font-semibold">
+                      <span
+                        style={{ backgroundColor: 'var(--md-sys-color-live)' }}
+                        className="h-2 w-2 rounded-full"
+                      />
+                      <span>Auto-Sync Beacon Active</span>
+                    </div>
+                    <p className="text-[11px] leading-snug opacity-90">
+                      Paired phones &amp; browsers automatically follow tunnel refreshes using
+                      AES-256-GCM encryption — zero accounts, zero VPN.
+                    </p>
+                  </div>
+                )}
               </div>
             )}
 
@@ -827,7 +974,7 @@ export function ConnectView({
                       style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
                       className="text-[11px]"
                     >
-                      Automatically brings up Cloudflare HTTPS access when PurrCam starts
+                      Automatically brings up a VPN-free HTTPS tunnel when PurrCam starts
                     </div>
                   </div>
                   <M3Switch
@@ -952,7 +1099,7 @@ export function ConnectView({
                       style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
                       className="mt-1.5 text-xs"
                     >
-                      Start the Cloudflare Remote Tunnel on the left to generate a 4G/5G QR code.
+                      Start the VPN-free Remote Tunnel on the left to generate a 4G/5G QR code.
                     </p>
                   </div>
                 )}
@@ -1567,31 +1714,58 @@ export function ConnectView({
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-2 pt-1">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
               <button
                 type="button"
-                onClick={() => {
-                  setDraftClientUrl('');
-                  setDraftClientToken('');
+                disabled={beaconSearching || !config.token}
+                onClick={async () => {
+                  setBeaconSearching(true);
+                  try {
+                    await onDiscoverBeacon();
+                  } finally {
+                    setBeaconSearching(false);
+                  }
                 }}
                 style={{
-                  backgroundColor: 'var(--md-sys-color-surface-container-high)',
-                  color: 'var(--md-sys-color-on-surface-variant)',
+                  backgroundColor: 'var(--md-sys-color-secondary-container)',
+                  color: 'var(--md-sys-color-on-secondary-container)',
                 }}
-                className="m3-morph-pill px-4 py-2 text-xs font-semibold"
+                className="m3-morph-pill flex items-center gap-1.5 px-4 py-2 text-xs font-semibold disabled:opacity-40"
               >
-                Reset to Default
+                {beaconSearching ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Radio className="h-3.5 w-3.5" />
+                )}
+                <span>Discover via Auto-Sync Beacon</span>
               </button>
-              <button
-                type="submit"
-                style={{
-                  backgroundColor: 'var(--md-sys-color-primary)',
-                  color: 'var(--md-sys-color-on-primary)',
-                }}
-                className="m3-morph-pill px-5 py-2 text-xs font-semibold"
-              >
-                Apply & Reconnect
-              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDraftClientUrl('');
+                    setDraftClientToken('');
+                  }}
+                  style={{
+                    backgroundColor: 'var(--md-sys-color-surface-container-high)',
+                    color: 'var(--md-sys-color-on-surface-variant)',
+                  }}
+                  className="m3-morph-pill px-4 py-2 text-xs font-semibold"
+                >
+                  Reset to Default
+                </button>
+                <button
+                  type="submit"
+                  style={{
+                    backgroundColor: 'var(--md-sys-color-primary)',
+                    color: 'var(--md-sys-color-on-primary)',
+                  }}
+                  className="m3-morph-pill px-5 py-2 text-xs font-semibold"
+                >
+                  Apply & Reconnect
+                </button>
+              </div>
             </div>
           </form>
         )}

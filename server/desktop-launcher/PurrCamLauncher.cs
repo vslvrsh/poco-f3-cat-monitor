@@ -51,6 +51,12 @@ namespace PurrCamLauncher
         [DllImport("kernel32.dll")]
         internal static extern bool CloseHandle(IntPtr hObject);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern uint SetThreadExecutionState(uint esFlags);
+
+        internal const uint ES_CONTINUOUS = 0x80000000;
+        internal const uint ES_SYSTEM_REQUIRED = 0x00000001;
+
         [StructLayout(LayoutKind.Sequential)]
         internal struct JOBOBJECT_BASIC_LIMIT_INFORMATION
         {
@@ -648,6 +654,7 @@ namespace PurrCamLauncher
         public bool openMonitorOnStartup = true;
         public bool autoStartTunnel = false;
         public bool minimizeToTrayOnClose = false;
+        public bool keepPcAwake = true;
     }
 
     public class MainForm : Form
@@ -688,6 +695,7 @@ namespace PurrCamLauncher
         private M3PillButton btnAdbReverse;
 
         private M3Badge badgeTunnelStatus;
+        private M3Badge badgeBeaconStatus;
         private M3PillButton btnToggleTunnel;
         private TextBox txtRemoteUrl;
         private M3PillButton btnCopyRemoteUrl;
@@ -701,6 +709,7 @@ namespace PurrCamLauncher
         private M3SwitchRow swOpenOnStartup;
         private M3SwitchRow swAutoStartTunnel;
         private M3SwitchRow swMinimizeToTray;
+        private M3SwitchRow swKeepPcAwake;
         private bool suppressSwitchEvents = false;
 
         private NotifyIcon trayIcon;
@@ -940,8 +949,8 @@ namespace PurrCamLauncher
         private void BuildUi()
         {
             this.Text = "PurrCam Control Center";
-            this.ClientSize = new Size(940, 710);
-            this.MinimumSize = new Size(900, 680);
+            this.ClientSize = new Size(940, 748);
+            this.MinimumSize = new Size(900, 720);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.BackColor = ColSurface;
             this.ForeColor = ColOnSurface;
@@ -1118,14 +1127,23 @@ namespace PurrCamLauncher
             this.Controls.Add(cardRight);
 
             Label lblRightHeader = new Label();
-            lblRightHeader.Text = "REMOTE ACCESS (4G / 5G OUTSIDE LAN)";
+            lblRightHeader.Text = "REMOTE ACCESS (NO VPN)";
             lblRightHeader.UseMnemonic = false;
             lblRightHeader.Font = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold);
             lblRightHeader.ForeColor = ColPrimary;
             lblRightHeader.BackColor = ColSurfaceContainer;
             lblRightHeader.AutoSize = true;
-            lblRightHeader.Location = new Point(24, 20);
+            lblRightHeader.Location = new Point(24, 18);
             cardRight.Controls.Add(lblRightHeader);
+
+            badgeBeaconStatus = new M3Badge();
+            badgeBeaconStatus.ParentSurfaceColor = ColSurfaceContainer;
+            badgeBeaconStatus.Font = new Font("Segoe UI Semibold", 8.0f, FontStyle.Bold);
+            badgeBeaconStatus.Text = "Auto-Sync Idle";
+            badgeBeaconStatus.SetTone(ColSurfaceHigh, ColOnSurfaceVariant, false);
+            badgeBeaconStatus.Size = new Size(184, 24);
+            badgeBeaconStatus.Location = new Point(230, 14);
+            cardRight.Controls.Add(badgeBeaconStatus);
 
             badgeTunnelStatus = new M3Badge();
             badgeTunnelStatus.ParentSurfaceColor = ColSurfaceContainer;
@@ -1145,7 +1163,7 @@ namespace PurrCamLauncher
             cardRight.Controls.Add(btnToggleTunnel);
 
             Label lblRemoteUrlCap = new Label();
-            lblRemoteUrlCap.Text = "Public HTTPS / WSS Tunnel URL (Cloudflare Quick Tunnel)";
+            lblRemoteUrlCap.Text = "Public HTTPS / WSS Tunnel URL (Auto · No VPN · Auto-Healing)";
             lblRemoteUrlCap.UseMnemonic = false;
             lblRemoteUrlCap.ForeColor = ColOnSurfaceVariant;
             lblRemoteUrlCap.BackColor = ColSurfaceContainer;
@@ -1301,7 +1319,7 @@ namespace PurrCamLauncher
             cardBottom.SurfaceColor = ColSurfaceContainer;
             cardBottom.ParentSurfaceColor = ColSurface;
             cardBottom.Location = new Point(26, 428);
-            cardBottom.Size = new Size(888, 258);
+            cardBottom.Size = new Size(888, 296);
             this.Controls.Add(cardBottom);
 
             Label lblLogsHeader = new Label();
@@ -1340,7 +1358,7 @@ namespace PurrCamLauncher
             logContainer.SurfaceColor = ColSurface;
             logContainer.ParentSurfaceColor = ColSurfaceContainer;
             logContainer.Location = new Point(22, 46);
-            logContainer.Size = new Size(844, 152);
+            logContainer.Size = new Size(844, 148);
             cardBottom.Controls.Add(logContainer);
 
             txtLogs = new TextBox();
@@ -1352,18 +1370,18 @@ namespace PurrCamLauncher
             txtLogs.ForeColor = Color.FromArgb(216, 206, 248);
             txtLogs.Font = new Font("Consolas", 9.2f, FontStyle.Regular);
             txtLogs.Location = new Point(14, 10);
-            txtLogs.Size = new Size(816, 132);
+            txtLogs.Size = new Size(816, 128);
             logContainer.Controls.Add(txtLogs);
 
-            // Authentic M3 Expressive Switches with Checkmarks
+            // Authentic M3 Expressive Switches with Checkmarks (2x2 clean grid)
             suppressSwitchEvents = true;
 
             swOpenOnStartup = new M3SwitchRow();
             swOpenOnStartup.ParentSurfaceColor = ColSurfaceContainer;
             swOpenOnStartup.Text = "Open Monitor UI on startup";
             swOpenOnStartup.Checked = this.settings.openMonitorOnStartup;
-            swOpenOnStartup.Size = new Size(256, 34);
-            swOpenOnStartup.Location = new Point(24, 210);
+            swOpenOnStartup.Size = new Size(340, 34);
+            swOpenOnStartup.Location = new Point(24, 206);
             swOpenOnStartup.CheckedChanged += delegate
             {
                 if (suppressSwitchEvents) return;
@@ -1374,10 +1392,10 @@ namespace PurrCamLauncher
 
             swAutoStartTunnel = new M3SwitchRow();
             swAutoStartTunnel.ParentSurfaceColor = ColSurfaceContainer;
-            swAutoStartTunnel.Text = "Auto-start Remote Tunnel";
+            swAutoStartTunnel.Text = "Auto-start Remote Tunnel (No VPN)";
             swAutoStartTunnel.Checked = this.settings.autoStartTunnel;
-            swAutoStartTunnel.Size = new Size(250, 34);
-            swAutoStartTunnel.Location = new Point(312, 210);
+            swAutoStartTunnel.Size = new Size(380, 34);
+            swAutoStartTunnel.Location = new Point(448, 206);
             swAutoStartTunnel.CheckedChanged += delegate
             {
                 if (suppressSwitchEvents) return;
@@ -1387,12 +1405,27 @@ namespace PurrCamLauncher
             };
             cardBottom.Controls.Add(swAutoStartTunnel);
 
+            swKeepPcAwake = new M3SwitchRow();
+            swKeepPcAwake.ParentSurfaceColor = ColSurfaceContainer;
+            swKeepPcAwake.Text = "Keep PC Awake while running";
+            swKeepPcAwake.Checked = this.settings.keepPcAwake;
+            swKeepPcAwake.Size = new Size(340, 34);
+            swKeepPcAwake.Location = new Point(24, 248);
+            swKeepPcAwake.CheckedChanged += delegate
+            {
+                if (suppressSwitchEvents) return;
+                this.settings.keepPcAwake = swKeepPcAwake.Checked;
+                SaveSettings();
+                ApplyKeepPcAwake(swKeepPcAwake.Checked);
+            };
+            cardBottom.Controls.Add(swKeepPcAwake);
+
             swMinimizeToTray = new M3SwitchRow();
             swMinimizeToTray.ParentSurfaceColor = ColSurfaceContainer;
             swMinimizeToTray.Text = "Minimize to System Tray on close";
             swMinimizeToTray.Checked = this.settings.minimizeToTrayOnClose;
-            swMinimizeToTray.Size = new Size(280, 34);
-            swMinimizeToTray.Location = new Point(584, 210);
+            swMinimizeToTray.Size = new Size(380, 34);
+            swMinimizeToTray.Location = new Point(448, 248);
             swMinimizeToTray.CheckedChanged += delegate
             {
                 if (suppressSwitchEvents) return;
@@ -1450,12 +1483,35 @@ namespace PurrCamLauncher
             this.Activate();
         }
 
+        private void ApplyKeepPcAwake(bool keepAwake)
+        {
+            try
+            {
+                if (keepAwake)
+                {
+                    NativeMethods.SetThreadExecutionState(NativeMethods.ES_CONTINUOUS | NativeMethods.ES_SYSTEM_REQUIRED);
+                }
+                else
+                {
+                    NativeMethods.SetThreadExecutionState(NativeMethods.ES_CONTINUOUS);
+                }
+            }
+            catch
+            {
+            }
+        }
+
         private void OnFormShown(object sender, EventArgs e)
         {
             SetupTrayIcon();
             this.Activate();
             NativeMethods.HideAuxiliaryTopLevelWindows(this.Handle);
+            ApplyKeepPcAwake(this.settings.keepPcAwake);
             AppendLog("[PurrCam] Material 3 Expressive Control Center initialized. Root: " + this.projectRoot);
+            if (this.settings.keepPcAwake)
+            {
+                AppendLog("[Power] Keep PC Awake enabled (ES_SYSTEM_REQUIRED).");
+            }
             Task.Run(delegate { EnsureServerRunningAsync(); });
 
             pollTimer = new System.Windows.Forms.Timer();
@@ -1702,21 +1758,41 @@ namespace PurrCamLauncher
                 lblCameraDetails.Text = "Launch Camera Mode on Poco F3 or click USB ADB Reverse below";
             }
 
-            // Remote Tunnel Status
+            // Remote Tunnel & Auto-Sync Beacon Status
             Dictionary<string, object> remote = GetDict(info, "remote");
             if (remote != null)
             {
                 string status = GetString(remote, "status", "stopped");
                 string provider = GetString(remote, "provider", "none");
+                string activeProvider = GetString(remote, "activeProvider", provider);
                 string rUrl = GetString(remote, "url", "");
                 string rErr = GetString(remote, "error", "");
+                Dictionary<string, object> beacon = GetDict(remote, "beacon");
+                bool beaconEnabled = beacon != null && GetBool(beacon, "enabled", false);
+
+                if (beaconEnabled)
+                {
+                    badgeBeaconStatus.Text = "Auto-Sync Beacon Active";
+                    badgeBeaconStatus.SetTone(ColEmeraldContainer, ColEmerald, true);
+                }
+                else
+                {
+                    badgeBeaconStatus.Text = "Auto-Sync Idle";
+                    badgeBeaconStatus.SetTone(ColSurfaceHigh, ColOnSurfaceVariant, false);
+                }
 
                 this.tunnelRunning = (status == "running");
                 this.currentRemoteHttpUrl = rUrl;
 
                 if (status == "running" && !string.IsNullOrEmpty(rUrl))
                 {
-                    string provLabel = provider == "cloudflare" ? "Cloudflare HTTPS" : provider.ToUpperInvariant();
+                    string provLabel = activeProvider == "localhost.run"
+                        ? "localhost.run"
+                        : activeProvider == "pinggy"
+                            ? "Pinggy :443"
+                            : activeProvider == "cloudflare"
+                                ? "Cloudflare HTTP/2"
+                                : activeProvider.ToUpperInvariant();
                     badgeTunnelStatus.Text = "Active · " + provLabel;
                     badgeTunnelStatus.SetTone(ColEmeraldContainer, ColEmerald, true);
                     txtRemoteUrl.Text = rUrl;
@@ -1731,7 +1807,7 @@ namespace PurrCamLauncher
                 {
                     badgeTunnelStatus.Text = "Starting Tunnel...";
                     badgeTunnelStatus.SetTone(ColAmberContainer, ColAmber, true);
-                    txtRemoteUrl.Text = "Connecting to Cloudflare Edge...";
+                    txtRemoteUrl.Text = !string.IsNullOrEmpty(rErr) ? rErr : "Connecting VPN-free Auto Tunnel...";
                 }
                 else if (status == "error")
                 {
@@ -1822,7 +1898,7 @@ namespace PurrCamLauncher
                 if (this.tunnelRunning)
                 {
                     btnToggleTunnel.Text = "Stopping...";
-                    AppendLog("[Remote] Stopping Cloudflare Quick Tunnel...");
+                    AppendLog("[Remote] Stopping Remote Access Tunnel...");
                     StringContent emptyBody = new StringContent("{}", Encoding.UTF8, "application/json");
                     await this.http.PostAsync(baseUrl + "/api/remote/stop", emptyBody);
                     ShowToast("Remote tunnel stopped.", false);
@@ -1832,15 +1908,15 @@ namespace PurrCamLauncher
                     btnToggleTunnel.Text = "Starting...";
                     badgeTunnelStatus.Text = "Starting Tunnel...";
                     badgeTunnelStatus.SetTone(ColAmberContainer, ColAmber, true);
-                    txtRemoteUrl.Text = "Starting cloudflared tunnel...";
-                    AppendLog("[Remote] Starting Cloudflare Quick Tunnel...");
+                    txtRemoteUrl.Text = "Starting VPN-free Auto Tunnel...";
+                    AppendLog("[Remote] Starting Auto Remote Tunnel (localhost.run -> Pinggy :443 -> Cloudflare HTTP/2)...");
 
-                    StringContent body = new StringContent("{\"provider\":\"cloudflare\"}", Encoding.UTF8, "application/json");
+                    StringContent body = new StringContent("{\"provider\":\"auto\"}", Encoding.UTF8, "application/json");
                     HttpResponseMessage resp = await this.http.PostAsync(baseUrl + "/api/remote/start", body);
                     string respText = await resp.Content.ReadAsStringAsync();
                     if (resp.IsSuccessStatusCode)
                     {
-                        ShowToast("Remote tunnel active! Ready for 4G/5G.", false);
+                        ShowToast("Remote tunnel & Auto-Sync Beacon active!", false);
                     }
                     else
                     {
@@ -2037,6 +2113,8 @@ namespace PurrCamLauncher
 
         private void CleanupResources()
         {
+            ApplyKeepPcAwake(false);
+
             try
             {
                 if (pollTimer != null) pollTimer.Stop();

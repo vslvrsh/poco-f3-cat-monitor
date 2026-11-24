@@ -1,6 +1,7 @@
 import type {
   IceServerConfig,
   RemoteConfig,
+  RemoteProvider,
   RemoteTunnelStatus,
   ServerInfo,
   SnapshotMeta,
@@ -188,14 +189,14 @@ export async function updateRemoteConfig(
 
 export async function startRemoteTunnel(
   serverUrl: string,
-  options?: { provider?: 'cloudflare' | 'custom'; customUrl?: string },
+  options?: { provider?: RemoteProvider; customUrl?: string },
   token?: string
 ): Promise<{ remote: RemoteTunnelStatus; pairingLink?: string; token?: string }> {
   const base = getHttpBaseUrl(serverUrl);
   const res = await fetch(`${base}/api/remote/start`, {
     method: 'POST',
     headers: buildHeaders(token, { 'Content-Type': 'application/json' }),
-    body: JSON.stringify(options ?? { provider: 'cloudflare' }),
+    body: JSON.stringify(options ?? { provider: 'auto' }),
   });
   if (!res.ok) {
     throw new ApiHttpError(res.status, await readErrorMessage(res, 'Failed to start remote tunnel'));

@@ -752,6 +752,10 @@ export function createHttpRequestHandler(deps: HttpHandlerDeps) {
 
           await configStore.updateConfig(patch);
 
+          if ("token" in patch) {
+            void tunnel.republishBeacon();
+          }
+
           if (
             "customRemoteUrl" in patch &&
             !patch.customRemoteUrl &&
@@ -775,17 +779,20 @@ export function createHttpRequestHandler(deps: HttpHandlerDeps) {
         const rawProvider = body.provider;
         const provider =
           rawProvider === undefined || rawProvider === null || rawProvider === ""
-            ? "cloudflare"
+            ? "auto"
             : rawProvider;
 
         if (
+          provider !== "auto" &&
+          provider !== "localhost.run" &&
+          provider !== "pinggy" &&
           provider !== "cloudflare" &&
           provider !== "custom" &&
           provider !== "tailscale"
         ) {
           throw new HttpError(
             400,
-            "provider must be 'cloudflare', 'custom', or 'tailscale'"
+            "provider must be 'auto', 'localhost.run', 'pinggy', 'cloudflare', 'custom', or 'tailscale'"
           );
         }
 

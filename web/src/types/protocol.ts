@@ -4,6 +4,32 @@ export type LensType = 'ultrawide' | 'wide' | 'tele' | 'macro' | 'front' | 'othe
 export type LensFacing = 'back' | 'front';
 export type ChargeSource = 'ac' | 'usb' | 'wireless' | 'none' | string;
 
+export type StreamMode = 'webrtc' | 'ws_relay';
+export type StreamModePreference = 'auto' | 'webrtc' | 'ws_relay';
+
+export type RemoteProvider =
+  | 'auto'
+  | 'localhost.run'
+  | 'pinggy'
+  | 'cloudflare'
+  | 'tailscale'
+  | 'custom'
+  | 'none';
+
+export type ActiveRemoteProvider =
+  | 'localhost.run'
+  | 'pinggy'
+  | 'cloudflare'
+  | 'tailscale'
+  | 'custom'
+  | 'none';
+
+export interface BeaconStatus {
+  enabled: boolean;
+  lastPublishedAt: number | null;
+  endpoints: string[];
+}
+
 export interface LensInfo {
   id: string;
   cameraId?: string;
@@ -84,10 +110,12 @@ export interface SnapshotMeta {
 export interface RemoteTunnelStatus {
   enabled: boolean;
   status: 'stopped' | 'starting' | 'running' | 'error';
-  provider: 'cloudflare' | 'tailscale' | 'custom' | 'none';
+  provider: RemoteProvider;
+  activeProvider?: ActiveRemoteProvider;
   url: string | null;
   wsUrl: string | null;
   error?: string | null;
+  beacon?: BeaconStatus;
 }
 
 export interface IceServerConfig {
@@ -155,7 +183,28 @@ export interface CommandPayloads {
   reboot_camera: Record<string, never>;
 }
 
-// Messages sent from Viewer -> Server (PurrCam Protocol v1.1)
+export interface VideoFrameMessage {
+  type: 'video_frame';
+  ts: number;
+  width: number;
+  height: number;
+  lensLabel?: string | null;
+  mime: string;
+  data: string;
+}
+
+export interface RelayVideoFrame {
+  dataUrl: string;
+  mime: string;
+  base64: string;
+  width: number;
+  height: number;
+  ts: number;
+  fps: number;
+  lensLabel?: string | null;
+}
+
+// Messages sent from Viewer -> Server (PurrCam Protocol v1.2)
 export type ViewerToServerMessage =
   | {
       type: 'register';
@@ -167,6 +216,13 @@ export type ViewerToServerMessage =
     }
   | { type: 'watch_request'; viewerId: string }
   | { type: 'watch_stop'; viewerId: string }
+  | {
+      type: 'stream_mode';
+      viewerId?: string;
+      mode: StreamMode;
+      fps?: number;
+      quality?: number;
+    }
   | { type: 'rtc_answer'; viewerId: string; sdp: string }
   | { type: 'rtc_ice'; viewerId: string; candidate: IceCandidatePayload }
   | {
@@ -177,7 +233,7 @@ export type ViewerToServerMessage =
     }
   | { type: 'ping'; ts: number };
 
-// Messages sent from Server -> Viewer (PurrCam Protocol v1.1)
+// Messages sent from Server -> Viewer (PurrCam Protocol v1.2)
 export type ServerToViewerMessage =
   | {
       type: 'registered';
@@ -194,6 +250,7 @@ export type ServerToViewerMessage =
   | { type: 'remote_status'; remote: RemoteTunnelStatus }
   | { type: 'rtc_offer'; viewerId: string; sdp: string | { sdp: string } }
   | { type: 'rtc_ice'; viewerId: string; candidate: IceCandidatePayload }
+  | VideoFrameMessage
   | { type: 'telemetry'; data: Telemetry }
   | { type: 'state_update'; state: Partial<CameraState>; lenses?: LensInfo[] }
   | {

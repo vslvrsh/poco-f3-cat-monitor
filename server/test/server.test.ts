@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import WebSocket from "ws";
 import { PurrCamServer } from "../dist/app.js";
 import {
+  decryptBeaconPayload,
+  deriveBeaconTopicId,
+  encryptBeaconPayload,
+} from "../dist/beacon.js";
+import {
   getLanIps,
   getTailscaleIp,
+  isLocalHostHeader,
   isLocalIpAddress,
   parseIceServers,
 } from "../dist/network.js";
@@ -17,6 +24,7 @@ import {
   generateStrongToken,
   isValidJpegBuffer,
 } from "../dist/security.js";
+import { parseBackendTunnelUrl } from "../dist/tunnel.js";
 
 class WsTestClient {
   readonly ws: WebSocket;
@@ -215,6 +223,73 @@ describe("Network & Security helpers", () => {
     assert.equal(limiter.isRateLimited("203.0.113.9"), false);
   });
 
+  it("matches Protocol v1.2 §8.3 encrypted beacon AES-256-GCM test vector and parses tunnel URLs", () => {
+    const token = "purrcam-test-vector-token-v1";
+    const topicId = deriveBeaconTopicId(token);
+    assert.equal(topicId, "purrcam-a793ba5e2ec528be44b8c7169f47de2d");
+
+    const iv = Buffer.from("AQIDBAUGBwgJCgsM", "base64");
+    const plaintext = {
+      v: 1 as const,
+      url: "https://demo.app.lhr.life",
+      wsUrl: "wss://demo.app.lhr.life/ws",
+      provider: "localhost.run",
+      ts: 1795500000000,
+    };
+    const env = encryptBeaconPayload(token, plaintext, iv);
+    assert.deepEqual(env, {
+      v: 1,
+      iv: "AQIDBAUGBwgJCgsM",
+      ct: "makxxxrVCdpbHF1dzommR5+Bzaej6iOtNkMXQzrV0M8Rgtkosyq7lOK1ENcS18T4qFASC4aWlqgXvNNv/cyS7kehKARzrygL4Fdu/b0HxJ7nj1zD7fNvMU7rPhbiZOX6RgDBFhtvuWTJgYOkeCnxTs0Rr/OVmB2OnsMgzWlESBdP2lBL/l5/Onl7sEk=",
+    });
+
+    assert.deepEqual(decryptBeaconPayload(token, JSON.stringify(env)), plaintext);
+    // Wrong token or tampered ciphertext rejected
+    assert.equal(decryptBeaconPayload("wrong-token", env), null);
+    assert.equal(
+      decryptBeaconPayload(token, { ...env, ct: "A" + env.ct.slice(1) }),
+      null
+    );
+
+    // Tunnel output URL parsers (must ignore banner links like https://admin.localhost.run)
+    assert.equal(
+      parseBackendTunnelUrl(
+        "localhost.run",
+        "Manage your account at https://admin.localhost.run"
+      ),
+      null
+    );
+    assert.equal(
+      parseBackendTunnelUrl(
+        "localhost.run",
+        '{"event":"tcpip-forward","address":"demo123.app.lhr.life","status":"success"}'
+      ),
+      "https://demo123.app.lhr.life"
+    );
+    assert.equal(
+      parseBackendTunnelUrl(
+        "pinggy",
+        "\u001b[32mhttps://abc123.a.free.pinggy.link\u001b[0m"
+      ),
+      "https://abc123.a.free.pinggy.link"
+    );
+    assert.equal(
+      parseBackendTunnelUrl(
+        "cloudflare",
+        "2026-01-01 INF | https://demo-tunnel.trycloudflare.com |"
+      ),
+      "https://demo-tunnel.trycloudflare.com"
+    );
+
+    // Host header locality checks
+    assert.equal(isLocalHostHeader("localhost:8787"), true);
+    assert.equal(isLocalHostHeader("127.0.0.1:8787"), true);
+    assert.equal(isLocalHostHeader("192.168.1.100:8787"), true);
+    assert.equal(isLocalHostHeader("[::1]:8787"), true);
+    assert.equal(isLocalHostHeader("demo123.app.lhr.life"), false);
+    assert.equal(isLocalHostHeader("abc.free.pinggy.net"), false);
+  });
+
   it("parses ICE_SERVERS from default, JSON, and comma-separated URLs", () => {
     assert.deepEqual(parseIceServers(undefined), [
       { urls: "stun:stun.l.google.com:19302" },
@@ -265,9 +340,15 @@ describe("PurrCam Server end-to-end", () => {
         enabled: false,
         status: "stopped",
         provider: "none",
+        activeProvider: "none",
         url: null,
         wsUrl: null,
         error: null,
+        beacon: {
+          enabled: false,
+          lastPublishedAt: null,
+          endpoints: [],
+        },
       });
 
       // 2. Fallback status HTML when web/dist isn't built
@@ -827,7 +908,9 @@ describe("PurrCam Server end-to-end", () => {
       token: "meow-secret",
       dataDir: path.join(tmpDir, "data"),
       webDistDir: webDist,
-      heartbeatIntervalMs: 120,
+      heartbeatIntervalMs: 60,
+      heartbeatMaxMissed: 3,
+      enableBeacon: false,
     });
 
     try {
@@ -919,7 +1002,8 @@ describe("PurrCam Server end-to-end", () => {
       const pong = await viewer.waitForType("pong");
       assert.equal(pong.ts, 123456);
 
-      // Heartbeat dead-peer pruning: connect raw camera that suppresses automatic pong frames
+      // Heartbeat 3-tick grace & dead-peer pruning:
+      // Unresponsive camera survives 2 missed ticks and is pruned cleanly on the 3rd+ tick
       const deadCamWs = new WebSocket(`${wsUrl}?token=meow-secret`, {
         autoPong: false,
       });
@@ -927,8 +1011,12 @@ describe("PurrCam Server end-to-end", () => {
         deadCamWs.once("open", () => resolve());
         deadCamWs.once("error", reject);
       });
+      let deadClosedFlag = false;
       const deadCamClosed = new Promise<void>((resolve) => {
-        deadCamWs.once("close", () => resolve());
+        deadCamWs.once("close", () => {
+          deadClosedFlag = true;
+          resolve();
+        });
       });
       deadCamWs.send(
         JSON.stringify({
@@ -941,7 +1029,11 @@ describe("PurrCam Server end-to-end", () => {
       const onlineMsg = await viewer.waitForType("camera_status");
       assert.equal(onlineMsg.online, true);
 
-      // Wait for heartbeat sweep to terminate unresponsive camera and notify viewer
+      // Should still be alive after ~1.5 ticks (survives brief jitter!)
+      await new Promise((r) => setTimeout(r, 95));
+      assert.equal(deadClosedFlag, false);
+
+      // Eventually pruned cleanly after 3 missed ticks
       await deadCamClosed;
       const prunedOffline = await viewer.waitForType("camera_status");
       assert.equal(prunedOffline.online, false);
@@ -962,6 +1054,7 @@ describe("PurrCam Server end-to-end", () => {
       host: "127.0.0.1",
       dataDir,
       webDistDir: path.join(tmpDir, "no-web"),
+      enableBeacon: false,
     });
 
     let generatedToken = "";
@@ -1162,6 +1255,54 @@ describe("PurrCam Server end-to-end", () => {
         ).status,
         403
       );
+
+      // 4c. Non-Cloudflare proxy headers (x-forwarded-host, via) & non-local Host header (e.g. localhost.run / Pinggy)
+      //     MUST ALSO be blocked with 403 on admin endpoints even with valid Bearer token!
+      assert.equal(
+        (
+          await fetch(`${baseUrl}/api/remote/config`, {
+            headers: {
+              "x-forwarded-host": "demo123.app.lhr.life",
+              Authorization: `Bearer ${generatedToken}`,
+            },
+          })
+        ).status,
+        403
+      );
+      assert.equal(
+        (
+          await fetch(`${baseUrl}/api/system/adb-reverse`, {
+            method: "POST",
+            headers: {
+              via: "1.1 pinggy",
+              Authorization: `Bearer ${generatedToken}`,
+            },
+          })
+        ).status,
+        403
+      );
+      // Direct raw HTTP request with non-local Host header and NO proxy headers
+      const rawHostStatus = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: info.port,
+            path: "/api/remote/config",
+            method: "GET",
+            headers: {
+              Host: "demo123.app.lhr.life",
+              Authorization: `Bearer ${generatedToken}`,
+            },
+          },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode ?? 0);
+          }
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      assert.equal(rawHostStatus, 403);
 
       // External viewer data requests WITH valid token succeed (200)
       assert.equal(
@@ -1367,6 +1508,101 @@ describe("PurrCam Server end-to-end", () => {
         },
       });
       assert.equal(cleanRes.status, 200);
+    } finally {
+      await server.stop();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("routes ws_relay stream_mode and video_frame exclusively to relay viewers and resets on disconnect", async () => {
+    const tmpDir = await makeTempDir("purrcam-test-wsrelay-");
+    const server = new PurrCamServer({
+      port: 0,
+      host: "127.0.0.1",
+      dataDir: path.join(tmpDir, "data"),
+      enableBeacon: false,
+    });
+
+    try {
+      const info = await server.start();
+      const wsUrl = `ws://127.0.0.1:${info.port}/ws`;
+
+      const camera = await WsTestClient.connect(wsUrl);
+      camera.send({
+        type: "register",
+        role: "camera",
+        deviceId: "relay-cam",
+        deviceName: "Relay Cam",
+      });
+      await camera.waitForType("registered");
+
+      const rtcViewer = await WsTestClient.connect(wsUrl);
+      rtcViewer.send({
+        type: "register",
+        role: "viewer",
+        clientId: "viewer-webrtc",
+        clientName: "WebRTC Client",
+        clientType: "web",
+      });
+      await rtcViewer.waitForType("registered");
+      await rtcViewer.waitForType("camera_status");
+      await camera.waitForType("viewer_joined");
+
+      const relayViewer = await WsTestClient.connect(wsUrl);
+      relayViewer.send({
+        type: "register",
+        role: "viewer",
+        clientId: "viewer-relay",
+        clientName: "4G Relay Client",
+        clientType: "android",
+      });
+      await relayViewer.waitForType("registered");
+      await relayViewer.waitForType("camera_status");
+      await camera.waitForType("viewer_joined");
+
+      // Switch viewer-relay into ws_relay mode
+      relayViewer.send({
+        type: "stream_mode",
+        mode: "ws_relay",
+        fps: 10,
+        quality: 70,
+      });
+      const camModeOn = await camera.waitForType("stream_mode");
+      assert.equal(camModeOn.viewerId, "viewer-relay");
+      assert.equal(camModeOn.mode, "ws_relay");
+      assert.equal(camModeOn.fps, 10);
+      assert.equal(camModeOn.quality, 70);
+
+      // Camera publishes video_frame -> ONLY relayViewer receives it
+      camera.send({
+        type: "video_frame",
+        ts: 1795500001000,
+        width: 720,
+        height: 1280,
+        lensLabel: "0.6× Wide",
+        mime: "image/jpeg",
+        data: Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64"),
+      });
+      const frame = await relayViewer.waitForType("video_frame");
+      assert.equal(frame.width, 720);
+      assert.equal(frame.height, 1280);
+      assert.equal(frame.lensLabel, "0.6× Wide");
+      assert.equal(frame.mime, "image/jpeg");
+
+      // rtcViewer must NOT receive relayed frames
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(rtcViewer.drainQueue().length, 0);
+
+      // When relayViewer disconnects, camera receives stream_mode("webrtc") + viewer_left
+      await relayViewer.close();
+      const camModeOff = await camera.waitForType("stream_mode");
+      assert.equal(camModeOff.viewerId, "viewer-relay");
+      assert.equal(camModeOff.mode, "webrtc");
+      const camLeft = await camera.waitForType("viewer_left");
+      assert.equal(camLeft.viewerId, "viewer-relay");
+
+      await rtcViewer.close();
+      await camera.close();
     } finally {
       await server.stop();
       await fs.rm(tmpDir, { recursive: true, force: true });

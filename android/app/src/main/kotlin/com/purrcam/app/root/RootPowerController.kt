@@ -193,6 +193,22 @@ class RootPowerController {
         }
     }
 
+    /**
+     * When KernelSU/Magisk root is granted, automatically exempts PurrCam from Android Doze
+     * using a strictly hardcoded command (zero dynamic or user-controlled arguments).
+     */
+    suspend fun whitelistDozeIfRooted(): Boolean = mutex.withLock {
+        if (!capabilities.hasRoot) return false
+        return withContext(Dispatchers.IO) {
+            val out = runSu("dumpsys deviceidle whitelist +com.purrcam.app")
+            val ok = out != null
+            if (ok) {
+                Log.i(TAG, "Root Doze whitelist applied for com.purrcam.app")
+            }
+            ok
+        }
+    }
+
     fun restoreNormalChargingBlocking() {
         val node = capabilities.chargeControlNode ?: return
         if (!capabilities.hasRoot || !isChargePaused) return

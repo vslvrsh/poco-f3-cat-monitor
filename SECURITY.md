@@ -1,13 +1,13 @@
 # Security Policy
 
-PurrCam is a self-hosted home camera and monitoring system designed to run on your local network, with optional encrypted remote access over 4G/5G via a Cloudflare Quick Tunnel, Tailscale, or your own reverse proxy.
+PurrCam is a self-hosted home camera and monitoring system designed to run on your local network, with optional encrypted remote access over 4G/5G via zero-signup VPN-free tunnels (`localhost.run`, `Pinggy :443`, Cloudflare HTTP/2), Tailscale, or your own reverse proxy.
 
 ## Security Architecture & Trust Boundaries
 
 ### 1. Local LAN vs. External Tunnel Boundary
 PurrCam enforces a strict separation between **local** callers and **external / proxied** callers:
 
-- A request or WebSocket connection is classified as **external** if **any** proxy header is present (`cf-connecting-ip`, `cf-ray`, `x-forwarded-for`, `forwarded`, `x-real-ip`) **or** the TCP socket peer address is outside loopback (`127.0.0.0/8`, `::1`) and private LAN ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, IPv6 ULA/link-local).
+- A request or WebSocket connection is classified as **external** if **any** proxy header is present (`cf-connecting-ip`, `cf-ray`, `x-forwarded-for`, `x-forwarded-host`, `forwarded`, `x-real-ip`, `via`), **or** the `Host` header is not `localhost` / loopback / private LAN IPv4 (protecting SSH reverse tunnels such as `localhost.run` and `Pinggy`), **or** the TCP socket peer address is outside loopback (`127.0.0.0/8`, `::1`) and private LAN ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, IPv6 ULA/link-local).
 - **Admin & Host-Management Endpoints Are Strictly Local-Only (`403 Forbidden`)**:
   - `GET /api/remote/config`, `PUT /api/remote/config`
   - `POST /api/remote/start`, `POST /api/remote/stop`
@@ -27,8 +27,9 @@ PurrCam enforces a strict separation between **local** callers and **external / 
 ### 3. Input, Upload & Transport Hardening
 - **Snapshot Validation**: `POST /api/snapshots` enforces a 10 MB size cap and verifies JPEG magic bytes (`0xFF 0xD8 0xFF`), rejecting invalid or disguised payloads with `400 Bad Request`.
 - **Sandboxed Serving**: `GET /snapshots/:filename` enforces strict basename-only filename validation (preventing path traversal) and serves files with `Content-Security-Policy: default-src 'none'; sandbox` and `X-Content-Type-Options: nosniff`.
-- **Payload Caps**: WebSocket frames are capped at `256 KB` and JSON API request bodies at `64 KB`.
-- **Safe Process Execution**: Local ADB helper execution uses `execFile` without a shell and validates device serial strings against `^[A-Za-z0-9._:-]+$`.
+- **Payload Caps**: WebSocket frames are capped at `1 MB` (supporting automatic `ws_relay` JPEG fallback with `256 KB` camera and `512 KB` server backpressure guards) and JSON API request bodies at `64 KB`.
+- **End-to-End Encrypted Auto-Discovery Beacon**: When free tunnels rotate their public URL, the PC server publishes the updated endpoint to `ntfy.sh` and `ntfy.envs.net` encrypted with **AES-256-GCM** (`SHA-256("purrcam:beacon:aes256:v1:" + token)`) under a one-way derived topic ID (`"purrcam-" + SHA-256("purrcam:beacon:topic:v1:" + token).slice(0, 32)`). Relay hosts only ever observe opaque random-IV ciphertext — never plaintext URLs or access tokens.
+- **Safe Process Execution**: Local ADB helper execution uses `execFile` without a shell and validates device serial strings against `^[A-Za-z0-9._:-]+$`. Tunnel subprocesses (`ssh.exe` / `cloudflared.exe`) are spawned via `execFile`/`spawn` with explicit argument arrays and zero shell interpolation.
 
 ### 4. Android App & Optional Root Safety
 - **No Cloud Credential Backup**: `AndroidManifest.xml` disables cloud/ADB backup (`android:allowBackup="false"`, `android:fullBackupContent="false"`) so server URLs and access tokens are never backed up externally.

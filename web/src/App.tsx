@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import {
   loadConnectionConfig,
@@ -31,7 +31,26 @@ export function App() {
   const [activeTab, setActiveTab] = useState<AppTab>('live');
   const [colorSeed, setColorSeed] = useState<M3ColorSeed>(() => loadSavedColorSeed());
 
-  const purr = usePurrCam(config);
+  const handleDiscoveredServerUrl = useCallback((newOrigin: string, provider?: string) => {
+    setConfig((prev) => {
+      const next: ConnectionConfig = { serverUrl: newOrigin, token: prev.token };
+      saveConnectionConfig(next);
+      return next;
+    });
+    purrPushToastRef.current?.(
+      'success',
+      provider
+        ? `Reconnected via Auto-Sync Beacon (${provider})`
+        : 'Reconnected via Auto-Sync Beacon'
+    );
+  }, []);
+
+  const purrPushToastRef = useState<{
+    current: ((tone: 'info' | 'success' | 'warning' | 'error', message: string) => void) | null;
+  }>(() => ({ current: null }))[0];
+
+  const purr = usePurrCam(config, handleDiscoveredServerUrl);
+  purrPushToastRef.current = purr.pushToast;
 
   // Sync Material 3 Dynamic Color Seed attribute onto <html>
   useEffect(() => {
@@ -110,6 +129,10 @@ export function App() {
           <LiveView
             wsStatus={purr.wsStatus}
             rtcStatus={purr.rtcStatus}
+            streamModePreference={purr.streamModePreference}
+            activeStreamMode={purr.activeStreamMode}
+            onSetStreamModePreference={purr.setStreamModePreference}
+            relayFrame={purr.relayFrame}
             cameraOnline={purr.cameraOnline}
             camera={purr.camera}
             telemetry={purr.telemetry}
@@ -160,6 +183,7 @@ export function App() {
             liveRemoteStatus={purr.remoteStatus}
             onRemoteStatusChange={purr.setRemoteStatus}
             onApplyConfig={handleApplyConfig}
+            onDiscoverBeacon={purr.discoverBeaconNow}
             onNotify={purr.pushToast}
           />
         )}

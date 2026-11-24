@@ -13,7 +13,7 @@ const SERVER_DIR = path.resolve(__dirname, "..");
 const PROJECT_ROOT = path.resolve(SERVER_DIR, "..");
 const WEB_DIST_DIR = path.join(PROJECT_ROOT, "web", "dist");
 const RELEASE_DIR = path.join(PROJECT_ROOT, "release-artifacts");
-const OUTPUT_ZIP = path.join(RELEASE_DIR, "PurrCam-Windows-v1.0.0.zip");
+const OUTPUT_ZIP = path.join(RELEASE_DIR, "PurrCam-Windows-v1.1.0.zip");
 
 function getHostLeakTokens() {
   const tokens = new Set();
@@ -78,11 +78,11 @@ async function scanDirectoryForLeaks(dir, tokens = getHostLeakTokens()) {
   }
 }
 
-const WINDOWS_README_TXT = `PurrCam for Windows — Quick Start (v1.0.0)
+const WINDOWS_README_TXT = `PurrCam for Windows — Quick Start (v1.1.0)
 ==========================================
 
 Requirements:
-  - Windows 10 / 11 (64-bit)
+  - Windows 10 / 11 (64-bit) with built-in OpenSSH (ssh.exe)
   - Node.js 20+ (LTS): https://nodejs.org
   - Microsoft Edge or Google Chrome (for the standalone desktop window)
 
@@ -91,26 +91,30 @@ Quick Start:
      Keep PurrCam.exe in the same folder as the "server" and "web" folders.
   2. Double-click PurrCam.exe.
      - Starts the local signaling & telemetry hub on port 8787 (no console window).
+     - Keeps your PC awake while PurrCam is running (toggleable in Control Center).
      - Opens the Material 3 Expressive Live Monitor desktop app automatically.
-  3. Install PurrCam-Android-v1.0.0.apk on your spare Android phone (Camera Mode)
+  3. Install PurrCam-Android-v1.1.0.apk on your spare Android phone (Camera Mode)
      and your main Android phone (Monitor Mode).
   4. On Camera Mode, enter your PC's Local URL shown in PurrCam Control Center
      (for example http://192.168.1.100:8787) or connect via USB using
      "Connect Poco F3 via USB (ADB Reverse)".
 
-Remote Access (4G / 5G Outside Home Wi-Fi):
+Always-On, VPN-Free, Zero-Account Remote Access (4G / 5G):
   1. Open the Connect tab in the desktop app (or PurrCam Control Center) and
      click "Start Remote Tunnel".
-  2. PurrCam automatically downloads the official cloudflared binary on first
-     use, starts an encrypted HTTPS/WSS Cloudflare Quick Tunnel, and generates
-     a 192-bit access token.
-  3. Scan the QR code or tap "Copy Phone Pairing Link (purrcam://)" to pair
-     your main phone in one tap.
+  2. PurrCam automatically starts a zero-signup VPN-free HTTPS/WSS tunnel
+     (Auto failover: localhost.run -> Pinggy :443 -> Cloudflare HTTP/2) with
+     an active 30s health watchdog, generates a 192-bit access token, and
+     publishes an end-to-end AES-256-GCM encrypted Auto-Sync Beacon.
+  3. Scan the QR code or tap "Copy Phone Pairing Link (purrcam://)" once.
+     Even if the free tunnel URL rotates later, your phone automatically
+     discovers the new URL via the encrypted beacon and switches to HTTPS
+     Video Relay seamlessly whenever 4G/5G CGNAT blocks WebRTC UDP!
 
 Security Notes:
-  - All external / tunneled connections require the generated access token.
+  - All external / tunneled connections require the 192-bit access token.
   - Admin endpoints (remote tunnel config, ADB reverse, PC server logs) are
-    strictly restricted to local LAN/loopback only (HTTP 403 over tunnel).
+    strictly restricted to local LAN/loopback only (HTTP 403 over any tunnel).
   - Server data (config, snapshots, telemetry history) is stored locally in
     server\\data\\.
 

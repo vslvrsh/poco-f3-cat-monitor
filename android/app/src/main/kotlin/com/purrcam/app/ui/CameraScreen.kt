@@ -1,5 +1,11 @@
 package com.purrcam.app.ui
 
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -76,6 +82,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -702,6 +709,9 @@ private fun CameraHealthTab(ui: CameraServiceUiState) {
             }
         }
 
+        // Always-On Background / Battery Optimization Exemption Card
+        AlwaysOnBatteryOptimizationCard()
+
         // Network & System Summary Row
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -723,6 +733,95 @@ private fun CameraHealthTab(ui: CameraServiceUiState) {
                 accentColor = MaterialTheme.colorScheme.secondary,
                 modifier = Modifier.weight(1f)
             )
+        }
+    }
+}
+
+@SuppressLint("BatteryLife")
+@Composable
+private fun AlwaysOnBatteryOptimizationCard() {
+    val context = LocalContext.current
+    val pm = remember(context) { context.getSystemService(Context.POWER_SERVICE) as PowerManager }
+    var isIgnoring by remember {
+        mutableStateOf(pm.isIgnoringBatteryOptimizations(context.packageName))
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            isIgnoring = pm.isIgnoringBatteryOptimizations(context.packageName)
+            delay(3000L)
+        }
+    }
+
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        shape = RoundedCornerShape(28.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "Always-On Background",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Surface(
+                    color = if (isIgnoring) PurrStatusColors.Live.copy(alpha = 0.18f)
+                    else PurrStatusColors.Warning.copy(alpha = 0.18f),
+                    shape = RoundedCornerShape(999.dp)
+                ) {
+                    Text(
+                        text = if (isIgnoring) "Unrestricted" else "Optimized",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (isIgnoring) PurrStatusColors.Live else PurrStatusColors.Warning,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+            Text(
+                text = if (isIgnoring) {
+                    "Android Doze exemption is active — camera streaming stays alive 24/7."
+                } else {
+                    "Exempt PurrCam from Android Doze / battery restrictions so the stream never sleeps overnight."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (!isIgnoring) {
+                FilledTonalButton(
+                    onClick = {
+                        try {
+                            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                data = Uri.parse("package:${context.packageName}")
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            context.startActivity(intent)
+                        } catch (_: Exception) {
+                            try {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
+                                )
+                            } catch (_: Exception) {
+                            }
+                        }
+                    },
+                    shape = RoundedCornerShape(999.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Rounded.BatteryChargingFull, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Disable Battery Optimization")
+                }
+            }
         }
     }
 }

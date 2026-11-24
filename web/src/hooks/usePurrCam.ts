@@ -7,26 +7,47 @@ import {
   type CommandPayloads,
   type IceCandidatePayload,
   type IceServerConfig,
+  type RelayVideoFrame,
   type RemoteTunnelStatus,
   type RtcConnectionStatus,
   type ServerToViewerMessage,
   type SnapshotMeta,
+  type StreamMode,
+  type StreamModePreference,
   type Telemetry,
   type ToastNotice,
+  type VideoFrameMessage,
   type ViewerToServerMessage,
   type WebRtcLiveStats,
   type WsConnectionStatus,
 } from '../types/protocol';
-import { getOrCreateClientId, getWsUrl, type ConnectionConfig } from '../lib/connection';
+import {
+  getOrCreateClientId,
+  getWsUrl,
+  normalizeServerUrlInput,
+  type ConnectionConfig,
+} from '../lib/connection';
 import { deleteSnapshotById, fetchSnapshots, fetchTelemetryHistory } from '../lib/api';
+import { discoverRemoteFromBeacon } from '../lib/beacon';
 
+const STORAGE_STREAM_MODE = 'purrcam.streamMode';
 const MAX_TELEMETRY_POINTS = 240;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_TIMEOUT_MS = 45_000;
 const STATS_POLL_INTERVAL_MS = 1_000;
+const WEBRTC_AUTO_FALLBACK_MS = 6_000;
+const WEBRTC_DISCONNECT_FALLBACK_MS = 5_000;
+const WEBRTC_STALL_WATCHDOG_MS = 10_000;
+const RATE_LIMIT_COOLDOWN_MS = 60_000;
+const BEACON_MIN_INTERVAL_MS = 20_000;
 
 export interface PurrCamController {
   wsStatus: WsConnectionStatus;
   rtcStatus: RtcConnectionStatus;
+  streamModePreference: StreamModePreference;
+  activeStreamMode: StreamMode;
+  setStreamModePreference: (pref: StreamModePreference) => void;
+  relayFrame: RelayVideoFrame | null;
   viewerId: string;
   viewerCount: number;
   cameraOnline: boolean;
@@ -51,6 +72,7 @@ export interface PurrCamController {
   ) => string | null;
   setTalkback: (active: boolean) => Promise<void>;
   reconnectStream: () => void;
+  discoverBeaconNow: () => Promise<boolean>;
   refreshSnapshots: () => Promise<void>;
   removeSnapshot: (id: string) => Promise<void>;
   addSnapshotLocal: (snap: SnapshotMeta) => void;
@@ -60,11 +82,36 @@ interface StatsPrevSample {
   ts: number;
   videoBytes: number;
   audioBytes: number;
+  framesDecoded: number;
+}
+
+function loadStreamModePreference(): StreamModePreference {
+  try {
+    const raw = localStorage.getItem(STORAGE_STREAM_MODE);
+    if (raw === 'auto' || raw === 'webrtc' || raw === 'ws_relay') return raw;
+  } catch {
+    // ignore storage errors
+  }
+  return 'auto';
+}
+
+function saveStreamModePreference(pref: StreamModePreference): void {
+  try {
+    localStorage.setItem(STORAGE_STREAM_MODE, pref);
+  } catch {
+    // ignore
+  }
 }
 
 function toRtcIceServers(servers: IceServerConfig[]): RTCIceServer[] {
   return servers
-    .filter((s) => s && (typeof s.urls === 'string' ? s.urls.trim().length > 0 : Array.isArray(s.urls) && s.urls.length > 0))
+    .filter(
+      (s) =>
+        s &&
+        (typeof s.urls === 'string'
+          ? s.urls.trim().length > 0
+          : Array.isArray(s.urls) && s.urls.length > 0)
+    )
     .map((s) => {
       const entry: RTCIceServer = { urls: s.urls };
       if (typeof s.username === 'string' && s.username.length > 0) {
@@ -77,11 +124,29 @@ function toRtcIceServers(servers: IceServerConfig[]): RTCIceServer[] {
     });
 }
 
-export function usePurrCam(config: ConnectionConfig): PurrCamController {
+function sanitizeImageMime(mime?: string): string {
+  const clean = (mime || '').toLowerCase().trim();
+  if (clean === 'image/jpeg' || clean === 'image/webp' || clean === 'image/png') {
+    return clean;
+  }
+  return 'image/jpeg';
+}
+
+export function usePurrCam(
+  config: ConnectionConfig,
+  onDiscoveredServerUrl?: (newOrigin: string, provider?: string) => void
+): PurrCamController {
   const clientIdRef = useRef<string>(getOrCreateClientId());
   const [viewerId, setViewerId] = useState<string>(clientIdRef.current);
   const [wsStatus, setWsStatus] = useState<WsConnectionStatus>('connecting');
   const [rtcStatus, setRtcStatus] = useState<RtcConnectionStatus>('idle');
+  const [streamModePreference, setStreamModePreferenceState] = useState<StreamModePreference>(() =>
+    loadStreamModePreference()
+  );
+  const [activeStreamMode, setActiveStreamMode] = useState<StreamMode>(() =>
+    loadStreamModePreference() === 'ws_relay' ? 'ws_relay' : 'webrtc'
+  );
+  const [relayFrame, setRelayFrame] = useState<RelayVideoFrame | null>(null);
   const [viewerCount, setViewerCount] = useState<number>(0);
   const [cameraOnline, setCameraOnline] = useState<boolean>(false);
   const [camera, setCamera] = useState<CameraSummary | null>(null);
@@ -96,22 +161,44 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
   const [pendingActions, setPendingActions] = useState<Record<string, boolean>>({});
   const [toasts, setToasts] = useState<ToastNotice[]>([]);
 
+  // Lifecycle & watchdog refs
   const wsRef = useRef<WebSocket | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const iceServersRef = useRef<RTCIceServer[]>([
     { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
   ]);
   const pendingIceRef = useRef<IceCandidatePayload[]>([]);
   const registeredIdRef = useRef<string>(clientIdRef.current);
   const cameraOnlineRef = useRef<boolean>(false);
+  const streamModePrefRef = useRef<StreamModePreference>(streamModePreference);
+  const activeStreamModeRef = useRef<StreamMode>(activeStreamMode);
+  const rtcStatusRef = useRef<RtcConnectionStatus>(rtcStatus);
+
   const wsReconnectTimerRef = useRef<number | null>(null);
   const wsRetryCountRef = useRef<number>(0);
   const heartbeatTimerRef = useRef<number | null>(null);
+  const lastPongTsRef = useRef<number>(Date.now());
+  const forceReconnectWsRef = useRef<(() => void) | null>(null);
+
   const rtcRetryTimerRef = useRef<number | null>(null);
   const offerWatchdogRef = useRef<number | null>(null);
+  const autoFallbackTimerRef = useRef<number | null>(null);
   const statsTimerRef = useRef<number | null>(null);
   const statsPrevRef = useRef<StatsPrevSample | null>(null);
+  const lastVideoProgressTsRef = useRef<number>(0);
+  const hasDecodedVideoRef = useRef<boolean>(false);
+
+  const relayFrameTimestampsRef = useRef<number[]>([]);
+  const lastRelayFrameTsRef = useRef<number>(0);
+  const relayWatchdogTimerRef = useRef<number | null>(null);
+
+  const lastBeaconQueryTsRef = useRef<number>(0);
+  const beaconInFlightRef = useRef<boolean>(false);
+  const onDiscoveredServerUrlRef = useRef(onDiscoveredServerUrl);
+  onDiscoveredServerUrlRef.current = onDiscoveredServerUrl;
+
   const pendingCmdMapRef = useRef<Map<string, { action: CommandAction; timer: number }>>(new Map());
 
   const silentAudioCtxRef = useRef<AudioContext | null>(null);
@@ -119,6 +206,14 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
   const micStreamRef = useRef<MediaStream | null>(null);
   const talkbackSenderRef = useRef<RTCRtpSender | null>(null);
   const talkbackActiveRef = useRef<boolean>(false);
+
+  const updateRtcStatus = useCallback((next: RtcConnectionStatus | ((prev: RtcConnectionStatus) => RtcConnectionStatus)) => {
+    setRtcStatus((prev) => {
+      const resolved = typeof next === 'function' ? next(prev) : next;
+      rtcStatusRef.current = resolved;
+      return resolved;
+    });
+  }, []);
 
   const pushToast = useCallback((tone: ToastNotice['tone'], message: string) => {
     const id = `t-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -184,9 +279,17 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
       window.clearTimeout(offerWatchdogRef.current);
       offerWatchdogRef.current = null;
     }
+    if (autoFallbackTimerRef.current !== null) {
+      window.clearTimeout(autoFallbackTimerRef.current);
+      autoFallbackTimerRef.current = null;
+    }
     if (statsTimerRef.current !== null) {
       window.clearInterval(statsTimerRef.current);
       statsTimerRef.current = null;
+    }
+    if (relayWatchdogTimerRef.current !== null) {
+      window.clearInterval(relayWatchdogTimerRef.current);
+      relayWatchdogTimerRef.current = null;
     }
   }, []);
 
@@ -196,6 +299,8 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
       pendingIceRef.current = [];
       talkbackSenderRef.current = null;
       statsPrevRef.current = null;
+      hasDecodedVideoRef.current = false;
+      lastVideoProgressTsRef.current = 0;
 
       if (pcRef.current) {
         try {
@@ -219,109 +324,256 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
     [clearRtcTimers, stopMicTracks]
   );
 
+  // Switch cleanly into WebSocket/HTTPS Video Relay fallback mode (Protocol v1.2 §9)
+  const activateWsRelay = useCallback(
+    (reason?: string) => {
+      closePeerConnection(false);
+      activeStreamModeRef.current = 'ws_relay';
+      setActiveStreamMode('ws_relay');
+      relayFrameTimestampsRef.current = [];
+      lastRelayFrameTsRef.current = Date.now();
+
+      if (cameraOnlineRef.current) {
+        updateRtcStatus('connecting');
+        sendWs({
+          type: 'stream_mode',
+          viewerId: registeredIdRef.current,
+          mode: 'ws_relay',
+          fps: 12,
+          quality: 72,
+        });
+
+        // Relay watchdog: re-assert stream_mode if frames stall >10s while camera is online
+        relayWatchdogTimerRef.current = window.setInterval(() => {
+          if (
+            activeStreamModeRef.current === 'ws_relay' &&
+            cameraOnlineRef.current &&
+            wsRef.current?.readyState === WebSocket.OPEN &&
+            Date.now() - lastRelayFrameTsRef.current > 10_000
+          ) {
+            lastRelayFrameTsRef.current = Date.now();
+            sendWs({
+              type: 'stream_mode',
+              viewerId: registeredIdRef.current,
+              mode: 'ws_relay',
+              fps: 12,
+              quality: 72,
+            });
+          }
+        }, 5_000);
+      } else {
+        updateRtcStatus('idle');
+      }
+
+      if (reason === 'webrtc-timeout' || reason === 'webrtc-failed' || reason === 'webrtc-stalled') {
+        pushToast('info', 'Switched to HTTPS Relay for smooth playback');
+      }
+    },
+    [closePeerConnection, pushToast, sendWs, updateRtcStatus]
+  );
+
   const requestWatch = useCallback(
     (reason?: string) => {
       if (!cameraOnlineRef.current) return;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
+      // If user explicitly chose HTTPS Relay, never launch WebRTC
+      if (streamModePrefRef.current === 'ws_relay') {
+        activateWsRelay('pref-relay');
+        return;
+      }
+
       if (offerWatchdogRef.current !== null) {
         window.clearTimeout(offerWatchdogRef.current);
         offerWatchdogRef.current = null;
       }
 
-      setRtcStatus((prev) => (prev === 'live' ? 'reconnecting' : 'requesting'));
+      activeStreamModeRef.current = 'webrtc';
+      setActiveStreamMode('webrtc');
+      setRelayFrame(null);
+      hasDecodedVideoRef.current = false;
+
+      // Ensure server/camera know we are in webrtc mode
+      if (reason === 'manual-webrtc' || reason === 'camera-online' || reason === 'manual') {
+        sendWs({
+          type: 'stream_mode',
+          viewerId: registeredIdRef.current,
+          mode: 'webrtc',
+        });
+      }
+
+      updateRtcStatus((prev) => (prev === 'live' ? 'reconnecting' : 'requesting'));
       sendWs({ type: 'watch_request', viewerId: registeredIdRef.current });
 
+      // In 'auto' mode, if WebRTC fails to deliver decoded frames within 6s, auto-fallback to ws_relay
+      if (streamModePrefRef.current === 'auto') {
+        if (autoFallbackTimerRef.current !== null) {
+          window.clearTimeout(autoFallbackTimerRef.current);
+        }
+        autoFallbackTimerRef.current = window.setTimeout(() => {
+          autoFallbackTimerRef.current = null;
+          if (
+            streamModePrefRef.current === 'auto' &&
+            activeStreamModeRef.current === 'webrtc' &&
+            cameraOnlineRef.current &&
+            wsRef.current?.readyState === WebSocket.OPEN &&
+            !hasDecodedVideoRef.current
+          ) {
+            activateWsRelay('webrtc-timeout');
+          }
+        }, WEBRTC_AUTO_FALLBACK_MS);
+      }
+
+      // Watchdog: if no offer arrives in 6s while in forced webrtc mode, retry watch_request
       offerWatchdogRef.current = window.setTimeout(() => {
+        offerWatchdogRef.current = null;
         if (
+          activeStreamModeRef.current === 'webrtc' &&
           cameraOnlineRef.current &&
           wsRef.current?.readyState === WebSocket.OPEN &&
           (!pcRef.current || pcRef.current.connectionState !== 'connected')
         ) {
-          requestWatch('watchdog');
+          if (streamModePrefRef.current === 'auto') {
+            activateWsRelay('webrtc-timeout');
+          } else {
+            requestWatch('watchdog');
+          }
         }
       }, reason === 'watchdog' ? 9_000 : 6_000);
     },
-    [sendWs]
+    [activateWsRelay, sendWs, updateRtcStatus]
   );
 
-  const startStatsPolling = useCallback((pc: RTCPeerConnection) => {
-    if (statsTimerRef.current !== null) {
-      window.clearInterval(statsTimerRef.current);
-    }
-    statsPrevRef.current = null;
-
-    statsTimerRef.current = window.setInterval(async () => {
-      if (pcRef.current !== pc || pc.connectionState === 'closed') return;
-      try {
-        const report = await pc.getStats();
-        let width = 0;
-        let height = 0;
-        let fps = 0;
-        let videoBytes = 0;
-        let audioBytes = 0;
-        let packetsLost = 0;
-        let rttMs: number | null = null;
-        let videoCodecId: string | null = null;
-        const codecs = new Map<string, string>();
-
-        report.forEach((stat) => {
-          if (stat.type === 'codec' && typeof stat.mimeType === 'string') {
-            codecs.set(stat.id, stat.mimeType.replace(/^(video|audio)\//i, ''));
-          } else if (stat.type === 'inbound-rtp') {
-            if (stat.kind === 'video') {
-              width = typeof stat.frameWidth === 'number' ? stat.frameWidth : width;
-              height = typeof stat.frameHeight === 'number' ? stat.frameHeight : height;
-              fps = typeof stat.framesPerSecond === 'number' ? stat.framesPerSecond : fps;
-              videoBytes = typeof stat.bytesReceived === 'number' ? stat.bytesReceived : videoBytes;
-              packetsLost += typeof stat.packetsLost === 'number' ? stat.packetsLost : 0;
-              if (typeof stat.codecId === 'string') videoCodecId = stat.codecId;
-            } else if (stat.kind === 'audio') {
-              audioBytes = typeof stat.bytesReceived === 'number' ? stat.bytesReceived : audioBytes;
-            }
-          } else if (
-            stat.type === 'candidate-pair' &&
-            (stat.nominated || stat.state === 'succeeded') &&
-            typeof stat.currentRoundTripTime === 'number'
-          ) {
-            rttMs = Math.round(stat.currentRoundTripTime * 1000);
-          }
-        });
-
-        const now = performance.now();
-        let bitrateKbps = 0;
-        let audioBitrateKbps = 0;
-
-        if (statsPrevRef.current && now > statsPrevRef.current.ts) {
-          const dtSec = (now - statsPrevRef.current.ts) / 1000;
-          if (videoBytes >= statsPrevRef.current.videoBytes) {
-            bitrateKbps = Math.round(((videoBytes - statsPrevRef.current.videoBytes) * 8) / dtSec / 1000);
-          }
-          if (audioBytes >= statsPrevRef.current.audioBytes) {
-            audioBitrateKbps = Math.round(((audioBytes - statsPrevRef.current.audioBytes) * 8) / dtSec / 1000);
-          }
-        }
-        statsPrevRef.current = { ts: now, videoBytes, audioBytes };
-
-        setRtcStats({
-          width,
-          height,
-          fps: Math.round(fps),
-          bitrateKbps,
-          audioBitrateKbps,
-          rttMs,
-          packetsLost,
-          codec: videoCodecId ? (codecs.get(videoCodecId) ?? null) : null,
-        });
-      } catch {
-        // ignore transient getStats errors
+  const startStatsPolling = useCallback(
+    (pc: RTCPeerConnection) => {
+      if (statsTimerRef.current !== null) {
+        window.clearInterval(statsTimerRef.current);
       }
-    }, STATS_POLL_INTERVAL_MS);
-  }, []);
+      statsPrevRef.current = null;
+      lastVideoProgressTsRef.current = Date.now();
+
+      statsTimerRef.current = window.setInterval(async () => {
+        if (pcRef.current !== pc || pc.connectionState === 'closed') return;
+        try {
+          const report = await pc.getStats();
+          let width = 0;
+          let height = 0;
+          let fps = 0;
+          let videoBytes = 0;
+          let audioBytes = 0;
+          let framesDecoded = 0;
+          let packetsLost = 0;
+          let rttMs: number | null = null;
+          let videoCodecId: string | null = null;
+          const codecs = new Map<string, string>();
+
+          report.forEach((stat) => {
+            if (stat.type === 'codec' && typeof stat.mimeType === 'string') {
+              codecs.set(stat.id, stat.mimeType.replace(/^(video|audio)\//i, ''));
+            } else if (stat.type === 'inbound-rtp') {
+              if (stat.kind === 'video') {
+                width = typeof stat.frameWidth === 'number' ? stat.frameWidth : width;
+                height = typeof stat.frameHeight === 'number' ? stat.frameHeight : height;
+                fps = typeof stat.framesPerSecond === 'number' ? stat.framesPerSecond : fps;
+                videoBytes =
+                  typeof stat.bytesReceived === 'number' ? stat.bytesReceived : videoBytes;
+                framesDecoded =
+                  typeof stat.framesDecoded === 'number' ? stat.framesDecoded : framesDecoded;
+                packetsLost +=
+                  typeof stat.packetsLost === 'number' ? stat.packetsLost : 0;
+                if (typeof stat.codecId === 'string') videoCodecId = stat.codecId;
+              } else if (stat.kind === 'audio') {
+                audioBytes =
+                  typeof stat.bytesReceived === 'number' ? stat.bytesReceived : audioBytes;
+              }
+            } else if (
+              stat.type === 'candidate-pair' &&
+              (stat.nominated || stat.state === 'succeeded') &&
+              typeof stat.currentRoundTripTime === 'number'
+            ) {
+              rttMs = Math.round(stat.currentRoundTripTime * 1000);
+            }
+          });
+
+          const now = performance.now();
+          const wallNow = Date.now();
+          let bitrateKbps = 0;
+          let audioBitrateKbps = 0;
+          let progressed = false;
+
+          if (statsPrevRef.current && now > statsPrevRef.current.ts) {
+            const dtSec = (now - statsPrevRef.current.ts) / 1000;
+            if (videoBytes > statsPrevRef.current.videoBytes) {
+              bitrateKbps = Math.round(
+                ((videoBytes - statsPrevRef.current.videoBytes) * 8) / dtSec / 1000
+              );
+              progressed = true;
+            }
+            if (framesDecoded > statsPrevRef.current.framesDecoded) {
+              progressed = true;
+            }
+            if (audioBytes >= statsPrevRef.current.audioBytes) {
+              audioBitrateKbps = Math.round(
+                ((audioBytes - statsPrevRef.current.audioBytes) * 8) / dtSec / 1000
+              );
+            }
+          } else if (videoBytes > 0 || framesDecoded > 0) {
+            progressed = true;
+          }
+
+          statsPrevRef.current = { ts: now, videoBytes, audioBytes, framesDecoded };
+
+          if (progressed || framesDecoded > 0 || width > 0) {
+            if (progressed) {
+              lastVideoProgressTsRef.current = wallNow;
+            }
+            if (framesDecoded > 0 || (progressed && videoBytes > 0)) {
+              hasDecodedVideoRef.current = true;
+              if (autoFallbackTimerRef.current !== null) {
+                window.clearTimeout(autoFallbackTimerRef.current);
+                autoFallbackTimerRef.current = null;
+              }
+            }
+          }
+
+          setRtcStats({
+            width,
+            height,
+            fps: Math.round(fps),
+            bitrateKbps,
+            audioBitrateKbps,
+            rttMs,
+            packetsLost,
+            codec: videoCodecId ? (codecs.get(videoCodecId) ?? null) : null,
+          });
+
+          // 10-second stalled-video watchdog while connected
+          if (
+            rtcStatusRef.current === 'live' &&
+            cameraOnlineRef.current &&
+            lastVideoProgressTsRef.current > 0 &&
+            wallNow - lastVideoProgressTsRef.current >= WEBRTC_STALL_WATCHDOG_MS
+          ) {
+            lastVideoProgressTsRef.current = wallNow;
+            if (streamModePrefRef.current === 'auto') {
+              activateWsRelay('webrtc-stalled');
+            } else {
+              requestWatch('stalled-video');
+            }
+          }
+        } catch {
+          // ignore transient getStats errors
+        }
+      }, STATS_POLL_INTERVAL_MS);
+    },
+    [activateWsRelay, requestWatch]
+  );
 
   const handleRtcOffer = useCallback(
     async (rawSdp: string | { sdp: string }) => {
+      if (activeStreamModeRef.current === 'ws_relay') return;
+
       const sdp = typeof rawSdp === 'string' ? rawSdp : rawSdp?.sdp;
       if (!sdp) return;
 
@@ -330,8 +582,26 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
         offerWatchdogRef.current = null;
       }
 
+      // Preserve auto-fallback timer if already running during initial connect
+      const keepFallbackActive =
+        streamModePrefRef.current === 'auto' && !hasDecodedVideoRef.current;
+
       closePeerConnection(true);
-      setRtcStatus('connecting');
+      updateRtcStatus('connecting');
+
+      if (keepFallbackActive) {
+        autoFallbackTimerRef.current = window.setTimeout(() => {
+          autoFallbackTimerRef.current = null;
+          if (
+            streamModePrefRef.current === 'auto' &&
+            activeStreamModeRef.current === 'webrtc' &&
+            cameraOnlineRef.current &&
+            !hasDecodedVideoRef.current
+          ) {
+            activateWsRelay('webrtc-timeout');
+          }
+        }, WEBRTC_AUTO_FALLBACK_MS);
+      }
 
       const pc = new RTCPeerConnection({
         iceServers: iceServersRef.current,
@@ -369,12 +639,16 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
         });
       };
 
-      const scheduleRecovery = (delayMs: number) => {
+      const scheduleRecovery = (delayMs: number, isFailure: boolean) => {
         if (rtcRetryTimerRef.current !== null) return;
         rtcRetryTimerRef.current = window.setTimeout(() => {
           rtcRetryTimerRef.current = null;
           if (pcRef.current === pc && cameraOnlineRef.current) {
-            requestWatch('ice-recovery');
+            if (streamModePrefRef.current === 'auto') {
+              activateWsRelay(isFailure ? 'webrtc-failed' : 'webrtc-timeout');
+            } else {
+              requestWatch('ice-recovery');
+            }
           }
         }, delayMs);
       };
@@ -387,24 +661,25 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
             window.clearTimeout(rtcRetryTimerRef.current);
             rtcRetryTimerRef.current = null;
           }
-          setRtcStatus('live');
+          updateRtcStatus('live');
+          startStatsPolling(pc);
         } else if (st === 'disconnected') {
-          setRtcStatus('reconnecting');
-          scheduleRecovery(3_500);
+          updateRtcStatus('reconnecting');
+          scheduleRecovery(WEBRTC_DISCONNECT_FALLBACK_MS, false);
         } else if (st === 'failed') {
-          setRtcStatus('reconnecting');
-          scheduleRecovery(1_200);
+          updateRtcStatus('reconnecting');
+          scheduleRecovery(1_000, true);
         }
       };
 
       pc.onconnectionstatechange = () => {
         if (pcRef.current !== pc) return;
         if (pc.connectionState === 'connected') {
-          setRtcStatus('live');
+          updateRtcStatus('live');
           startStatsPolling(pc);
         } else if (pc.connectionState === 'failed') {
-          setRtcStatus('reconnecting');
-          scheduleRecovery(1_200);
+          updateRtcStatus('reconnecting');
+          scheduleRecovery(1_000, true);
         }
       };
 
@@ -416,8 +691,7 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
           .getTransceivers()
           .find(
             (t) =>
-              t.receiver.track?.kind === 'audio' ||
-              t.sender.track?.kind === 'audio'
+              t.receiver.track?.kind === 'audio' || t.sender.track?.kind === 'audio'
           );
 
         const activeMicTrack = micStreamRef.current?.getAudioTracks()[0] ?? null;
@@ -460,11 +734,19 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
         }
       } catch (err) {
         console.error('[PurrCam] WebRTC offer handling failed:', err);
-        setRtcStatus('failed');
-        scheduleRecovery(2_000);
+        updateRtcStatus('failed');
+        scheduleRecovery(1_500, true);
       }
     },
-    [closePeerConnection, getOrCreateSilentTrack, requestWatch, sendWs, startStatsPolling]
+    [
+      activateWsRelay,
+      closePeerConnection,
+      getOrCreateSilentTrack,
+      requestWatch,
+      sendWs,
+      startStatsPolling,
+      updateRtcStatus,
+    ]
   );
 
   const handleRemoteIce = useCallback(async (candidate: IceCandidatePayload) => {
@@ -484,6 +766,113 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
       // ignore stale ICE candidates
     }
   }, []);
+
+  const handleVideoFrame = useCallback(
+    (msg: VideoFrameMessage) => {
+      if (!msg.data || typeof msg.data !== 'string') return;
+      const now = Date.now();
+      lastRelayFrameTsRef.current = now;
+
+      // Compute rolling FPS over the last 1.5s window
+      const timestamps = relayFrameTimestampsRef.current;
+      timestamps.push(now);
+      const cutoff = now - 1_500;
+      while (timestamps.length > 0 && timestamps[0] < cutoff) {
+        timestamps.shift();
+      }
+      const spanSec =
+        timestamps.length >= 2
+          ? Math.max(0.25, (timestamps[timestamps.length - 1] - timestamps[0]) / 1000)
+          : 1;
+      const fps = timestamps.length >= 2 ? Math.round((timestamps.length - 1) / spanSec) : 1;
+
+      const mime = sanitizeImageMime(msg.mime);
+      setRelayFrame({
+        dataUrl: `data:${mime};base64,${msg.data}`,
+        mime,
+        base64: msg.data,
+        width: typeof msg.width === 'number' ? msg.width : 0,
+        height: typeof msg.height === 'number' ? msg.height : 0,
+        ts: typeof msg.ts === 'number' ? msg.ts : now,
+        fps,
+        lensLabel: msg.lensLabel ?? null,
+      });
+
+      if (activeStreamModeRef.current !== 'ws_relay') {
+        activeStreamModeRef.current = 'ws_relay';
+        setActiveStreamMode('ws_relay');
+      }
+      if (rtcStatusRef.current !== 'live') {
+        updateRtcStatus('live');
+      }
+    },
+    [updateRtcStatus]
+  );
+
+  const setStreamModePreference = useCallback(
+    (pref: StreamModePreference) => {
+      streamModePrefRef.current = pref;
+      setStreamModePreferenceState(pref);
+      saveStreamModePreference(pref);
+
+      if (!cameraOnlineRef.current) {
+        if (pref === 'ws_relay') {
+          activeStreamModeRef.current = 'ws_relay';
+          setActiveStreamMode('ws_relay');
+        } else {
+          activeStreamModeRef.current = 'webrtc';
+          setActiveStreamMode('webrtc');
+        }
+        return;
+      }
+
+      if (pref === 'ws_relay') {
+        activateWsRelay('manual');
+      } else if (pref === 'webrtc') {
+        closePeerConnection(false);
+        requestWatch('manual-webrtc');
+      } else {
+        // Switching to 'auto' — try WebRTC fresh with 6s automatic fallback
+        closePeerConnection(false);
+        requestWatch('manual-webrtc');
+      }
+    },
+    [activateWsRelay, closePeerConnection, requestWatch]
+  );
+
+  const discoverBeaconNow = useCallback(
+    async (silent = false): Promise<boolean> => {
+      const token = config.token.trim();
+      if (!token || beaconInFlightRef.current) return false;
+      beaconInFlightRef.current = true;
+      lastBeaconQueryTsRef.current = Date.now();
+
+      try {
+        const discovered = await discoverRemoteFromBeacon(token);
+        if (!discovered) {
+          if (!silent) {
+            pushToast('warning', 'No active Auto-Sync Beacon found for this token');
+          }
+          return false;
+        }
+
+        const discoveredOrigin = normalizeServerUrlInput(discovered.url);
+        const currentOrigin = normalizeServerUrlInput(config.serverUrl || window.location.origin);
+
+        if (discoveredOrigin && discoveredOrigin !== currentOrigin) {
+          onDiscoveredServerUrlRef.current?.(discoveredOrigin, discovered.provider);
+          return true;
+        }
+        if (!silent) {
+          pushToast('info', `Beacon matches current server (${discovered.provider})`);
+        }
+        return false;
+      } finally {
+        beaconInFlightRef.current = false;
+      }
+    },
+    [config.serverUrl, config.token, pushToast]
+  );
 
   const sendCommand = useCallback(
     <A extends CommandAction>(
@@ -525,6 +914,10 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
   const setTalkback = useCallback(
     async (active: boolean) => {
       if (active === talkbackActiveRef.current) return;
+      if (active && activeStreamModeRef.current === 'ws_relay') {
+        pushToast('info', 'Switch to WebRTC in Tune to use two-way Talkback');
+        return;
+      }
       setTalkbackBusy(true);
 
       try {
@@ -618,9 +1011,13 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
 
   const reconnectStream = useCallback(() => {
     if (!cameraOnlineRef.current) return;
-    closePeerConnection(true);
-    requestWatch('manual');
-  }, [closePeerConnection, requestWatch]);
+    if (streamModePrefRef.current === 'ws_relay') {
+      activateWsRelay('manual');
+    } else {
+      closePeerConnection(true);
+      requestWatch('manual');
+    }
+  }, [activateWsRelay, closePeerConnection, requestWatch]);
 
   useEffect(() => {
     let cancelled = false;
@@ -648,6 +1045,7 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
     };
   }, [config.serverUrl, config.token]);
 
+  // Main WebSocket connection + 45s heartbeat watchdog + visibility/online recovery + beacon failover
   useEffect(() => {
     let disposed = false;
 
@@ -660,6 +1058,11 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
 
     const connect = () => {
       if (disposed) return;
+
+      if (wsReconnectTimerRef.current !== null) {
+        window.clearTimeout(wsReconnectTimerRef.current);
+        wsReconnectTimerRef.current = null;
+      }
 
       const wsUrl = getWsUrl(config.serverUrl, config.token);
       setWsStatus(wsRetryCountRef.current > 0 ? 'reconnecting' : 'connecting');
@@ -678,6 +1081,7 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
       ws.onopen = () => {
         if (disposed || wsRef.current !== ws) return;
         wsRetryCountRef.current = 0;
+        lastPongTsRef.current = Date.now();
         setWsStatus('connected');
 
         sendWs({
@@ -691,12 +1095,24 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
 
         clearHeartbeat();
         heartbeatTimerRef.current = window.setInterval(() => {
+          if (wsRef.current !== ws || ws.readyState !== WebSocket.OPEN) return;
+          if (Date.now() - lastPongTsRef.current > HEARTBEAT_TIMEOUT_MS) {
+            // Zombie/half-open WS detected (>45s without pong/message) — force immediate reconnect
+            try {
+              ws.close(4008, 'Heartbeat timeout');
+            } catch {
+              // ignore
+            }
+            return;
+          }
           sendWs({ type: 'ping', ts: Date.now() });
         }, HEARTBEAT_INTERVAL_MS);
       };
 
       ws.onmessage = (event) => {
         if (disposed || wsRef.current !== ws) return;
+        lastPongTsRef.current = Date.now();
+
         let msg: ServerToViewerMessage;
         try {
           msg = JSON.parse(String(event.data)) as ServerToViewerMessage;
@@ -749,18 +1165,27 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
                 setTelemetry(normalizedCam.telemetry);
               }
 
-              const needsStream =
-                !wasOnline ||
-                (!pcRef.current && offerWatchdogRef.current === null) ||
-                pcRef.current?.connectionState === 'failed' ||
-                pcRef.current?.connectionState === 'closed';
-              if (needsStream) {
-                requestWatch('camera-online');
+              if (streamModePrefRef.current === 'ws_relay') {
+                if (!wasOnline || activeStreamModeRef.current !== 'ws_relay') {
+                  activateWsRelay('camera-online');
+                }
+              } else if (activeStreamModeRef.current === 'ws_relay' && wasOnline) {
+                // Already cleanly playing via automatic HTTPS relay — do not interrupt on state_update
+              } else {
+                const needsStream =
+                  !wasOnline ||
+                  (!pcRef.current && offerWatchdogRef.current === null) ||
+                  pcRef.current?.connectionState === 'failed' ||
+                  pcRef.current?.connectionState === 'closed';
+                if (needsStream) {
+                  requestWatch('camera-online');
+                }
               }
             } else {
               setCamera(null);
+              setRelayFrame(null);
               closePeerConnection(false);
-              setRtcStatus('idle');
+              updateRtcStatus('idle');
             }
             break;
           }
@@ -779,6 +1204,11 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
 
           case 'rtc_ice': {
             void handleRemoteIce(msg.candidate);
+            break;
+          }
+
+          case 'video_frame': {
+            handleVideoFrame(msg);
             break;
           }
 
@@ -873,23 +1303,43 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
         clearHeartbeat();
         wsRef.current = null;
         closePeerConnection(false);
+        setRelayFrame(null);
         cameraOnlineRef.current = false;
         setCameraOnline(false);
-        setRtcStatus('idle');
+        updateRtcStatus('idle');
 
         if (ev.code === 4001) {
           setWsStatus('auth_error');
           return;
         }
+
         if (ev.code === 4029) {
-          setWsStatus('auth_error');
-          pushToast('warning', 'Too many failed auth attempts — please wait a few minutes');
+          // 60-second cooldown retry on rate limit (never permanent stop)
+          setWsStatus('reconnecting');
+          pushToast('warning', 'Rate limited — retrying automatically in 60s');
+          wsReconnectTimerRef.current = window.setTimeout(connect, RATE_LIMIT_COOLDOWN_MS);
           return;
         }
 
         setWsStatus('reconnecting');
-        const delay = Math.min(1000 * Math.pow(1.6, wsRetryCountRef.current), 8_000);
         wsRetryCountRef.current += 1;
+
+        // If remote WS failed >= 2 times and we have a token, query encrypted beacon for rotated tunnel URL
+        const hasToken = config.token.trim().length > 0;
+        const effectiveHost = (config.serverUrl || window.location.origin).toLowerCase();
+        const isLocalOnly =
+          effectiveHost.includes('://localhost') || effectiveHost.includes('://127.0.0.1');
+
+        if (
+          hasToken &&
+          !isLocalOnly &&
+          wsRetryCountRef.current >= 2 &&
+          Date.now() - lastBeaconQueryTsRef.current >= BEACON_MIN_INTERVAL_MS
+        ) {
+          void discoverBeaconNow(true);
+        }
+
+        const delay = Math.min(1000 * Math.pow(1.6, wsRetryCountRef.current - 1), 8_000);
         wsReconnectTimerRef.current = window.setTimeout(connect, delay);
       };
 
@@ -898,10 +1348,65 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
       };
     };
 
+    forceReconnectWsRef.current = () => {
+      if (disposed) return;
+      const cur = wsRef.current;
+      if (cur) {
+        try {
+          cur.onopen = null;
+          cur.onmessage = null;
+          cur.onclose = null;
+          cur.onerror = null;
+          cur.close();
+        } catch {
+          // ignore
+        }
+        wsRef.current = null;
+      }
+      clearHeartbeat();
+      wsRetryCountRef.current = 0;
+      connect();
+    };
+
+    const handleWakeup = () => {
+      if (disposed) return;
+      if (document.visibilityState === 'hidden') return;
+
+      const ws = wsRef.current;
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        forceReconnectWsRef.current?.();
+        return;
+      }
+
+      if (ws.readyState === WebSocket.OPEN) {
+        if (Date.now() - lastPongTsRef.current > 25_000) {
+          forceReconnectWsRef.current?.();
+          return;
+        }
+        sendWs({ type: 'ping', ts: Date.now() });
+
+        if (cameraOnlineRef.current) {
+          if (activeStreamModeRef.current === 'ws_relay') {
+            if (Date.now() - lastRelayFrameTsRef.current > 6_000) {
+              activateWsRelay('wakeup');
+            }
+          } else if (!pcRef.current || pcRef.current.connectionState !== 'connected') {
+            requestWatch('wakeup');
+          }
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleWakeup);
+    window.addEventListener('online', handleWakeup);
+
     connect();
 
     return () => {
       disposed = true;
+      forceReconnectWsRef.current = null;
+      document.removeEventListener('visibilitychange', handleWakeup);
+      window.removeEventListener('online', handleWakeup);
       clearHeartbeat();
       if (wsReconnectTimerRef.current !== null) {
         window.clearTimeout(wsReconnectTimerRef.current);
@@ -912,6 +1417,15 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
       if (wsRef.current) {
         try {
           if (wsRef.current.readyState === WebSocket.OPEN) {
+            if (activeStreamModeRef.current === 'ws_relay') {
+              wsRef.current.send(
+                JSON.stringify({
+                  type: 'stream_mode',
+                  viewerId: registeredIdRef.current,
+                  mode: 'webrtc',
+                })
+              );
+            }
             wsRef.current.send(
               JSON.stringify({ type: 'watch_stop', viewerId: registeredIdRef.current })
             );
@@ -933,20 +1447,28 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
       }
     };
   }, [
+    activateWsRelay,
     addSnapshotLocal,
     closePeerConnection,
     config.serverUrl,
     config.token,
+    discoverBeaconNow,
     handleRemoteIce,
     handleRtcOffer,
+    handleVideoFrame,
     pushToast,
     requestWatch,
     sendWs,
+    updateRtcStatus,
   ]);
 
   return {
     wsStatus,
     rtcStatus,
+    streamModePreference,
+    activeStreamMode,
+    setStreamModePreference,
+    relayFrame,
     viewerId,
     viewerCount,
     cameraOnline,
@@ -967,6 +1489,7 @@ export function usePurrCam(config: ConnectionConfig): PurrCamController {
     sendCommand,
     setTalkback,
     reconnectStream,
+    discoverBeaconNow: () => discoverBeaconNow(false),
     refreshSnapshots,
     removeSnapshot,
     addSnapshotLocal,

@@ -28,6 +28,8 @@ import org.webrtc.VideoTrack
 import org.webrtc.audio.JavaAudioDeviceModule
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
@@ -41,7 +43,7 @@ class CameraWebRtcManager(
     private val onCameraError: (String) -> Unit
 ) {
     private val appContext = context.applicationContext
-    private val executor = Executors.newSingleThreadExecutor { r ->
+    private val executor = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "PurrCam-WebRTC").apply { isDaemon = true }
     }
     private val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -78,6 +80,7 @@ class CameraWebRtcManager(
     private var speakerEnabled: Boolean = true
 
     private var previewSink: VideoSink? = null
+    private var relaySink: VideoSink? = null
 
     private data class ViewerPeer(
         val viewerId: String,
@@ -85,7 +88,8 @@ class CameraWebRtcManager(
         val videoSender: RtpSender?,
         var remoteDescSet: Boolean = false,
         val pendingRemoteIce: MutableList<IceCandidate> = mutableListOf(),
-        val remoteAudioTracks: MutableList<AudioTrack> = mutableListOf()
+        val remoteAudioTracks: MutableList<AudioTrack> = mutableListOf(),
+        var disconnectGraceFuture: ScheduledFuture<*>? = null
     )
 
     private val peers = ConcurrentHashMap<String, ViewerPeer>()
@@ -112,6 +116,12 @@ class CameraWebRtcManager(
                 }
                 videoTrack = vTrack
                 previewSink?.let { sink ->
+                    try {
+                        vTrack.addSink(sink)
+                    } catch (_: Exception) {
+                    }
+                }
+                relaySink?.let { sink ->
                     try {
                         vTrack.addSink(sink)
                     } catch (_: Exception) {
@@ -184,6 +194,25 @@ class CameraWebRtcManager(
         }
     }
 
+    fun attachRelaySink(sink: VideoSink?) {
+        executor.execute {
+            val track = videoTrack
+            relaySink?.let { old ->
+                try {
+                    track?.removeSink(old)
+                } catch (_: Exception) {
+                }
+            }
+            relaySink = sink
+            if (sink != null && track != null) {
+                try {
+                    track.addSink(sink)
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
     fun handleWatchRequest(viewerId: String) {
         executor.execute {
             if (disposed.get() || factory == null) return@execute
@@ -201,14 +230,29 @@ class CameraWebRtcManager(
 
                 override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
                     Log.d(TAG, "Viewer $viewerId ICE state: $state")
-                    if (state == PeerConnection.IceConnectionState.FAILED ||
-                        state == PeerConnection.IceConnectionState.CLOSED
-                    ) {
-                        executor.execute {
-                            val target = peerRef.get()
-                            if (target != null && peers[viewerId] === target) {
+                    executor.execute {
+                        val target = peerRef.get() ?: return@execute
+                        if (peers[viewerId] !== target) return@execute
+                        when (state) {
+                            PeerConnection.IceConnectionState.CONNECTED,
+                            PeerConnection.IceConnectionState.COMPLETED -> {
+                                target.disconnectGraceFuture?.cancel(false)
+                                target.disconnectGraceFuture = null
+                            }
+                            PeerConnection.IceConnectionState.DISCONNECTED -> {
+                                target.disconnectGraceFuture?.cancel(false)
+                                target.disconnectGraceFuture = executor.schedule({
+                                    if (peers[viewerId] === target && !disposed.get()) {
+                                        Log.w(TAG, "Viewer $viewerId ICE DISCONNECTED >5s — closing stale peer")
+                                        closePeerLocked(viewerId, expectedPeer = target)
+                                    }
+                                }, 5, TimeUnit.SECONDS)
+                            }
+                            PeerConnection.IceConnectionState.FAILED,
+                            PeerConnection.IceConnectionState.CLOSED -> {
                                 closePeerLocked(viewerId, expectedPeer = target)
                             }
+                            else -> {}
                         }
                     }
                 }
@@ -424,6 +468,8 @@ class CameraWebRtcManager(
         val current = peers[viewerId] ?: return
         if (expectedPeer != null && current !== expectedPeer) return
         val removed = peers.remove(viewerId) ?: return
+        removed.disconnectGraceFuture?.cancel(false)
+        removed.disconnectGraceFuture = null
         try {
             removed.pc.close()
             removed.pc.dispose()
@@ -445,6 +491,14 @@ class CameraWebRtcManager(
                 }
             }
             previewSink = null
+
+            relaySink?.let { sink ->
+                try {
+                    videoTrack?.removeSink(sink)
+                } catch (_: Exception) {
+                }
+            }
+            relaySink = null
 
             try {
                 capturer?.dispose()

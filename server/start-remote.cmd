@@ -23,6 +23,6 @@ if not exist "dist\index.js" (
 )
 
 set "PURRCAM_REMOTE=1"
-echo [PurrCam] Starting PC Hub Server with Remote Access (Cloudflare Quick Tunnel)...
+echo [PurrCam] Starting PC Hub Server with Auto VPN-Free Remote Access Tunnel...
 node dist\index.js
 endlocal

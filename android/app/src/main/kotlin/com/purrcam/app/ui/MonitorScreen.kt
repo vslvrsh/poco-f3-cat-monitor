@@ -109,6 +109,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.purrcam.app.monitor.MonitorClient
 import com.purrcam.app.monitor.MonitorUiState
+import com.purrcam.app.monitor.StreamModePreference
 import com.purrcam.app.protocol.SnapshotMeta
 import com.purrcam.app.ui.components.ConnectServerBottomSheet
 import com.purrcam.app.ui.components.ExpressiveLensDock
@@ -252,6 +253,7 @@ fun MonitorScreen(
                     localServerUrl = localServerUrl,
                     remoteServerUrl = remoteServerUrl,
                     authToken = authToken,
+                    onRefreshBeacon = { client.refreshRemoteFromBeacon() },
                     onOpenConnectSheet = { showConnectSheet = true },
                     onSwitchMode = onExit
                 )
@@ -302,6 +304,24 @@ fun MonitorScreen(
                     style = MaterialTheme.typography.headlineSmall,
                     color = MaterialTheme.colorScheme.onSurface
                 )
+
+                // Stream Transport Mode (Auto / WebRTC / HTTPS Relay)
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Stream Transport",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    ExpressiveSegmentedPills(
+                        options = StreamModePreference.entries.map { it.label },
+                        selected = ui.streamPreference.label,
+                        onSelect = { label ->
+                            val pref = StreamModePreference.entries.firstOrNull { it.label == label }
+                                ?: StreamModePreference.AUTO
+                            client.setStreamPreference(pref)
+                        }
+                    )
+                }
 
                 // Cat Sounds Row
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -485,22 +505,44 @@ private fun MonitorLiveTab(
                 )
             }
     ) {
-        // Properly-oriented WebRTC SurfaceViewRenderer (Fit = zero crop, Fill = edge-to-edge)
-        MonitorVideoView(
-            client = client,
-            fitMode = fitMode,
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer(
-                    scaleX = viewScale,
-                    scaleY = viewScale,
-                    translationX = viewOffset.x,
-                    translationY = viewOffset.y
+        val isRelayMode = ui.activeStreamMode == "ws_relay"
+        val isStreamLive = ui.rtcConnected || (isRelayMode && ui.relayConnected)
+
+        // Properly-oriented video surface: WebRTC SurfaceViewRenderer OR HTTPS Relay ImageBitmap
+        if (isRelayMode) {
+            val relayBmp = ui.relayFrame
+            if (relayBmp != null) {
+                Image(
+                    bitmap = relayBmp,
+                    contentDescription = "Live HTTPS Relay stream",
+                    contentScale = if (fitMode) ContentScale.Fit else ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = viewScale,
+                            scaleY = viewScale,
+                            translationX = viewOffset.x,
+                            translationY = viewOffset.y
+                        )
                 )
-        )
+            }
+        } else {
+            MonitorVideoView(
+                client = client,
+                fitMode = fitMode,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(
+                        scaleX = viewScale,
+                        scaleY = viewScale,
+                        translationX = viewOffset.x,
+                        translationY = viewOffset.y
+                    )
+            )
+        }
 
         // Waiting / Offline state
-        if (!ui.cameraOnline || !ui.rtcConnected) {
+        if (!ui.cameraOnline || !isStreamLive) {
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.88f),
                 shape = RoundedCornerShape(24.dp),
@@ -521,7 +563,8 @@ private fun MonitorLiveTab(
                         text = when {
                             !ui.wsConnected -> ui.statusText
                             !ui.cameraOnline -> "Waiting for camera..."
-                            else -> "Connecting WebRTC video..."
+                            isRelayMode -> "Connecting HTTPS Relay..."
+                            else -> "Connecting video..."
                         },
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onSurface
@@ -571,14 +614,21 @@ private fun MonitorLiveTab(
                             .clip(CircleShape)
                             .background(
                                 when {
-                                    ui.rtcConnected -> PurrStatusColors.Live
+                                    isStreamLive -> PurrStatusColors.Live
                                     ui.cameraOnline -> PurrStatusColors.Warning
                                     else -> PurrStatusColors.Danger
                                 }
                             )
                     )
                     val summaryText = buildString {
-                        append(if (ui.rtcConnected) "LIVE" else if (ui.cameraOnline) "LINKING" else "OFFLINE")
+                        append(
+                            when {
+                                isRelayMode && ui.relayConnected -> "LIVE · HTTPS Relay"
+                                ui.rtcConnected -> "LIVE"
+                                ui.cameraOnline -> "LINKING"
+                                else -> "OFFLINE"
+                            }
+                        )
                         if (tel != null) {
                             append(" · ${tel.batteryPct}%")
                             append(" · ${String.format(Locale.US, "%.0f°C", tel.batteryTempC)}")
@@ -1262,6 +1312,7 @@ private fun MonitorSettingsTab(
     localServerUrl: String,
     remoteServerUrl: String,
     authToken: String,
+    onRefreshBeacon: () -> Unit,
     onOpenConnectSheet: () -> Unit,
     onSwitchMode: () -> Unit
 ) {
@@ -1323,7 +1374,7 @@ private fun MonitorSettingsTab(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
-                    text = "PurrCam tries Local Wi-Fi first (2.5s timeout) and seamlessly falls back to your Remote HTTPS/WSS tunnel on 4G/5G.",
+                    text = "PurrCam tries Local Wi-Fi first (2.5s timeout), falls back to Remote 4G/5G with automatic Encrypted Beacon URL discovery, and switches to HTTPS Relay automatically if UDP is blocked.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1335,6 +1386,17 @@ private fun MonitorSettingsTab(
                     Icon(Icons.Rounded.Link, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("Import Pairing Link / Edit Server")
+                }
+                if (authToken.isNotBlank()) {
+                    FilledTonalButton(
+                        onClick = onRefreshBeacon,
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Refresh Remote URL from Beacon")
+                    }
                 }
             }
         }

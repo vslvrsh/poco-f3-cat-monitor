@@ -65,8 +65,10 @@ const PROXY_HEADERS = [
   "cf-connecting-ip",
   "cf-ray",
   "x-forwarded-for",
-  "forwarded",
+  "x-forwarded-host",
   "x-real-ip",
+  "via",
+  "forwarded",
 ] as const;
 
 export function hasProxyHeaders(req: IncomingMessage): boolean {
@@ -76,6 +78,33 @@ export function hasProxyHeaders(req: IncomingMessage): boolean {
     if (Array.isArray(val) && val.some((v) => v.trim().length > 0)) return true;
   }
   return false;
+}
+
+/**
+ * Extracts the bare hostname (without port or IPv6 brackets) from an HTTP Host header.
+ */
+export function extractHostHeaderHostname(hostHeader?: string): string {
+  if (!hostHeader || !hostHeader.trim()) return "";
+  const trimmed = hostHeader.trim().toLowerCase();
+  if (trimmed.startsWith("[")) {
+    const closeIdx = trimmed.indexOf("]");
+    if (closeIdx > 1) return trimmed.slice(1, closeIdx);
+  }
+  const colonIdx = trimmed.lastIndexOf(":");
+  if (colonIdx !== -1 && trimmed.indexOf(":") === colonIdx) {
+    return trimmed.slice(0, colonIdx);
+  }
+  return trimmed;
+}
+
+/**
+ * Returns true if the Host header refers strictly to localhost or a local LAN/loopback IP.
+ */
+export function isLocalHostHeader(hostHeader?: string): boolean {
+  const host = extractHostHeaderHostname(hostHeader);
+  if (!host) return true; // Missing Host header falls back to socket remoteAddress check
+  if (host === "localhost") return true;
+  return isLocalIpAddress(host);
 }
 
 /**
@@ -111,15 +140,25 @@ export function extractClientIp(req: IncomingMessage): string {
   if (typeof xRealIp === "string" && xRealIp.trim()) {
     return normalizeRemoteIp(xRealIp);
   }
+  const forwarded = req.headers.forwarded;
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    const match = /for="?\[?([^;,"\]]+)/i.exec(forwarded);
+    if (match?.[1]) return normalizeRemoteIp(match[1]);
+  }
   return normalizeRemoteIp(req.socket?.remoteAddress) || "unknown";
 }
 
 /**
  * Returns true when an incoming HTTP/WS request arrived via a reverse tunnel/proxy
- * (Cloudflare / forwarded headers) or from a non-loopback, non-RFC1918 IP address.
+ * (Cloudflare / localhost.run / Pinggy / forwarded headers), carries a non-local Host
+ * header, or originates from a non-loopback, non-RFC1918 IP address.
  */
 export function isExternalRequest(req: IncomingMessage): boolean {
   if (hasProxyHeaders(req)) return true;
+  const hostHeader = req.headers.host;
+  if (typeof hostHeader === "string" && !isLocalHostHeader(hostHeader)) {
+    return true;
+  }
   const remoteAddr = req.socket?.remoteAddress;
   return !isLocalIpAddress(remoteAddr);
 }

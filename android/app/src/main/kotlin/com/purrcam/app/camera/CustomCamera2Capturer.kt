@@ -19,6 +19,7 @@ import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
 import android.util.Range
 import android.util.Size
@@ -85,13 +86,30 @@ class CustomCamera2Capturer(
     private val isDisposed = AtomicBoolean(false)
     private val openGeneration = AtomicInteger(0)
 
-    // Measured FPS tracking
+    // Measured FPS & stall watchdog tracking
     private var fpsWindowStartNs = 0L
     private var fpsFrameCounter = 0
 
     @Volatile
+    private var lastFrameElapsedMs = 0L
+
+    @Volatile
     var measuredFps: Int = 0
         private set
+
+    private val stallWatchdogRunnable = object : Runnable {
+        override fun run() {
+            if (!isRunning.get() || isDisposed.get()) return
+            val now = SystemClock.elapsedRealtime()
+            val last = lastFrameElapsedMs
+            if (last > 0L && now - last > STALL_TIMEOUT_MS) {
+                Log.w(TAG, "Camera2 stall watchdog triggered (${now - last}ms without frames) — reopening camera")
+                lastFrameElapsedMs = now
+                restartCapture()
+            }
+            cameraHandler?.postDelayed(this, STALL_CHECK_INTERVAL_MS)
+        }
+    }
 
     // Snapshot requests
     private val pendingJpegSnapshot = AtomicReference<CompletableDeferred<ByteArray?>?>(null)
@@ -123,6 +141,9 @@ class CustomCamera2Capturer(
             isRunning.set(true)
         }
         capturerObserver?.onCapturerStarted(true)
+        lastFrameElapsedMs = SystemClock.elapsedRealtime()
+        cameraHandler?.removeCallbacks(stallWatchdogRunnable)
+        cameraHandler?.postDelayed(stallWatchdogRunnable, STALL_CHECK_INTERVAL_MS)
         cameraHandler?.post {
             usingFallbackTarget = false
             openActiveLensLocked(openGeneration.incrementAndGet())
@@ -131,6 +152,7 @@ class CustomCamera2Capturer(
 
     override fun stopCapture() {
         isRunning.set(false)
+        cameraHandler?.removeCallbacks(stallWatchdogRunnable)
         val gen = openGeneration.incrementAndGet()
         val done = CompletableDeferred<Unit>()
         val handler = cameraHandler
@@ -315,6 +337,7 @@ class CustomCamera2Capturer(
 
         val outFrame = VideoFrame(outBuffer, frameOrientation, frame.timestampNs)
         try {
+            lastFrameElapsedMs = SystemClock.elapsedRealtime()
             // Track measured FPS
             val nowNs = System.nanoTime()
             if (fpsWindowStartNs == 0L) {
@@ -785,5 +808,7 @@ class CustomCamera2Capturer(
 
     companion object {
         private const val TAG = "PurrCamCapturer"
+        private const val STALL_TIMEOUT_MS = 12_000L
+        private const val STALL_CHECK_INTERVAL_MS = 4_000L
     }
 }

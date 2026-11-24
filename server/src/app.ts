@@ -54,10 +54,12 @@ export function resolveConfig(
     maxTelemetrySamples: overrides.maxTelemetrySamples ?? 720,
     telemetryFlushIntervalMs: overrides.telemetryFlushIntervalMs ?? 10_000,
     heartbeatIntervalMs: overrides.heartbeatIntervalMs ?? 15_000,
+    heartbeatMaxMissed: overrides.heartbeatMaxMissed ?? 3,
     registerTimeoutMs: overrides.registerTimeoutMs ?? 15_000,
     maxSnapshotBytes: overrides.maxSnapshotBytes ?? 10 * 1024 * 1024,
     authRateLimitMaxFailures: overrides.authRateLimitMaxFailures ?? 15,
     authRateLimitWindowMs: overrides.authRateLimitWindowMs ?? 5 * 60 * 1000,
+    enableBeacon: overrides.enableBeacon ?? true,
   };
 }
 
@@ -104,6 +106,7 @@ export class PurrCamServer {
       rateLimiter: this.rateLimiter,
       onLog: (msg) => this.logBuffer.append(msg),
       heartbeatIntervalMs: this.config.heartbeatIntervalMs,
+      heartbeatMaxMissed: this.config.heartbeatMaxMissed,
       registerTimeoutMs: this.config.registerTimeoutMs,
     });
 
@@ -111,6 +114,7 @@ export class PurrCamServer {
       binDir: this.config.binDir,
       configStore: this.configStore,
       getPort: () => this.port,
+      enableBeacon: this.config.enableBeacon,
       onLog: (msg) => this.logBuffer.append(msg),
       onStatusChange: (status) => {
         this.signaling.broadcastRemoteStatus(status);
@@ -213,12 +217,12 @@ export class PurrCamServer {
       `[PurrCam] Server v${SERVER_VERSION} listening on port ${this.boundPort} (LAN: ${this.lanIps.join(", ") || "localhost"}, WS: ${this.wsUrl})`
     );
 
-    // Auto-start Cloudflare Quick Tunnel if requested via PURRCAM_REMOTE=1 or persisted config
+    // Auto-start VPN-free remote tunnel (auto failover chain) if requested
     if (
       this.config.autoStartRemote ||
       this.configStore.getConfig().autoStartTunnel
     ) {
-      void this.tunnel.start({ provider: "cloudflare" }).catch((err) => {
+      void this.tunnel.start({ provider: "auto" }).catch((err) => {
         console.error(
           "[purrcam] Failed to auto-start remote tunnel:",
           err instanceof Error ? err.message : err

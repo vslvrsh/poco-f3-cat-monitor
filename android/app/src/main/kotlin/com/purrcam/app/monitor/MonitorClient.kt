@@ -4,11 +4,18 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.content.ContextCompat
 import com.purrcam.app.camera.CameraWebRtcManager
 import com.purrcam.app.camera.SimpleSdpObserver
@@ -28,6 +35,7 @@ import com.purrcam.app.protocol.RtcIceMsg
 import com.purrcam.app.protocol.ServerUrlHelper
 import com.purrcam.app.protocol.SnapshotListResponseDto
 import com.purrcam.app.protocol.SnapshotMeta
+import com.purrcam.app.protocol.StreamModeMsg
 import com.purrcam.app.protocol.Telemetry
 import com.purrcam.app.protocol.WatchRequestMsg
 import com.purrcam.app.protocol.WatchStopMsg
@@ -73,15 +81,24 @@ import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
 import org.webrtc.RtpTransceiver
 import org.webrtc.SessionDescription
+import org.webrtc.VideoFrame
 import org.webrtc.VideoSink
 import org.webrtc.VideoTrack
 import org.webrtc.audio.JavaAudioDeviceModule
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Base64
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+
+enum class StreamModePreference(val label: String) {
+    AUTO("Auto"),
+    WEBRTC("WebRTC"),
+    WS_RELAY("HTTPS Relay")
+}
 
 data class MonitorUiState(
     val wsConnected: Boolean = false,
@@ -89,6 +106,10 @@ data class MonitorUiState(
     val activeHttpBaseUrl: String = "http://127.0.0.1:8787",
     val cameraOnline: Boolean = false,
     val rtcConnected: Boolean = false,
+    val streamPreference: StreamModePreference = StreamModePreference.AUTO,
+    val activeStreamMode: String = "webrtc", // "webrtc" | "ws_relay"
+    val relayFrame: ImageBitmap? = null,
+    val relayConnected: Boolean = false,
     val statusText: String = "Connecting...",
     val viewerCount: Int = 0,
     val camera: CameraSummary? = null,
@@ -109,12 +130,13 @@ class MonitorClient(private val context: Context) {
         Thread(r, "PurrCam-MonitorRTC").apply { isDaemon = true }
     }
     private val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val connectivityManager = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
         .build()
 
     // Fast 2.5s connect timeout when probing Local LAN with Remote failover configured
@@ -122,7 +144,7 @@ class MonitorClient(private val context: Context) {
         .connectTimeout(2500, TimeUnit.MILLISECONDS)
         .build()
 
-    // Standard HTTP client for REST calls (gallery, snapshots)
+    // Standard HTTP client for REST calls (gallery, snapshots, beacon)
     private val restClient = OkHttpClient.Builder()
         .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -137,14 +159,24 @@ class MonitorClient(private val context: Context) {
     private var remoteEndpoint: ParsedServerEndpoint? = null
     private var activeEndpoint: ParsedServerEndpoint = localEndpoint
     private var tryingRemote = false
+    private var remoteFailCount = 0
     private var authToken: String = ""
     private var clientId: String = prefs.getOrCreateClientId()
 
     @Volatile
     private var webSocket: WebSocket? = null
     private val wsGeneration = AtomicInteger(0)
+    private val lastWsActivityMs = AtomicLong(0L)
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val lastNetworkHandle = AtomicLong(-1L)
+
     private var reconnectJob: Job? = null
     private var pingJob: Job? = null
+    private var watchTimeoutJob: Job? = null
+    private var autoRelayFallbackJob: Job? = null
+    private var iceDisconnectGraceJob: Job? = null
+    private var frameStallWatchdogJob: Job? = null
+
     private val wsConnected = AtomicBoolean(false)
     private val stopped = AtomicBoolean(false)
     private var reconnectDelayMs = 1000L
@@ -158,6 +190,16 @@ class MonitorClient(private val context: Context) {
     private var localAudioSource: AudioSource? = null
     private var localTalkbackTrack: AudioTrack? = null
     private var videoSink: VideoSink? = null
+
+    private val lastWebRtcFrameMs = AtomicLong(0L)
+    private val lastRelayFrameMs = AtomicLong(0L)
+    private val relayDecodeInFlight = AtomicBoolean(false)
+
+    // Wrapper sink that forwards frames to SurfaceViewRenderer while tracking frame arrival timestamps
+    private val frameWatchSink = VideoSink { frame: VideoFrame ->
+        lastWebRtcFrameMs.set(SystemClock.elapsedRealtime())
+        videoSink?.onFrame(frame)
+    }
 
     private var remoteDescSet = false
     private val pendingRemoteIce = mutableListOf<IceCandidate>()
@@ -174,8 +216,10 @@ class MonitorClient(private val context: Context) {
     fun start(localUrl: String, remoteUrl: String = "", token: String = "") {
         stopped.set(false)
         configureEndpoints(localUrl, remoteUrl, token)
+        registerNetworkCallback()
         rtcExecutor.execute { ensureRtcFactory() }
         connectWs()
+        startFrameStallWatchdog()
     }
 
     fun reconnectWith(localUrl: String, remoteUrl: String, token: String) {
@@ -185,6 +229,89 @@ class MonitorClient(private val context: Context) {
         configureEndpoints(localUrl, remoteUrl, token)
         reconnectDelayMs = 1000L
         connectWs()
+    }
+
+    fun refreshRemoteFromBeacon() {
+        if (authToken.isBlank()) {
+            _uiState.update { it.copy(toastMessage = "Access token required for Beacon sync") }
+            return
+        }
+        scope.launch {
+            _uiState.update { it.copy(statusText = "Refreshing remote URL...") }
+            val resolved = BeaconResolver.resolveLatest(authToken, restClient)
+            if (resolved != null) {
+                val parsed = ServerUrlHelper.parse(resolved.wsUrl)
+                prefs.remoteServerUrl = parsed.wsUrl
+                remoteEndpoint = parsed
+                tryingRemote = true
+                reconnectDelayMs = 1000L
+                _uiState.update { it.copy(toastMessage = "Remote URL updated (${resolved.provider})") }
+                connectWs()
+            } else {
+                _uiState.update { it.copy(toastMessage = "No active remote tunnel found in Beacon") }
+            }
+        }
+    }
+
+    fun setStreamPreference(pref: StreamModePreference) {
+        _uiState.update { it.copy(streamPreference = pref) }
+        if (!wsConnected.get() || !_uiState.value.cameraOnline) return
+        when (pref) {
+            StreamModePreference.WS_RELAY -> activateWsRelay(reason = "Switched to HTTPS Relay")
+            StreamModePreference.WEBRTC -> switchToWebRtc()
+            StreamModePreference.AUTO -> {
+                if (_uiState.value.activeRoute == "Local") {
+                    switchToWebRtc()
+                } else {
+                    switchToWebRtc()
+                }
+            }
+        }
+    }
+
+    private fun switchToWebRtc() {
+        autoRelayFallbackJob?.cancel()
+        iceDisconnectGraceJob?.cancel()
+        _uiState.update {
+            it.copy(
+                activeStreamMode = "webrtc",
+                relayConnected = false,
+                relayFrame = null,
+                statusText = "Connecting video..."
+            )
+        }
+        sendWsJson(PurrJson.encodeToString(StreamModeMsg(viewerId = clientId, mode = "webrtc")))
+        sendWatchRequest()
+    }
+
+    private fun activateWsRelay(reason: String? = null) {
+        if (!wsConnected.get() || !_uiState.value.cameraOnline) return
+        autoRelayFallbackJob?.cancel()
+        watchTimeoutJob?.cancel()
+        iceDisconnectGraceJob?.cancel()
+        watchInFlight.set(false)
+        rtcExecutor.execute { closePeerConnectionLocked() }
+        lastRelayFrameMs.set(SystemClock.elapsedRealtime())
+        _uiState.update {
+            it.copy(
+                activeStreamMode = "ws_relay",
+                rtcConnected = false,
+                statusText = "Connecting HTTPS Relay..."
+            )
+        }
+        sendWsJson(
+            PurrJson.encodeToString(
+                StreamModeMsg(
+                    viewerId = clientId,
+                    mode = "ws_relay",
+                    fps = 8,
+                    quality = 60
+                )
+            )
+        )
+        if (!reason.isNullOrBlank()) {
+            Log.i(TAG, "Activated ws_relay: $reason")
+        }
     }
 
     private fun configureEndpoints(rawLocal: String, rawRemote: String, explicitToken: String) {
@@ -202,6 +329,7 @@ class MonitorClient(private val context: Context) {
             tryingRemote = false
             activeEndpoint = localEndpoint
         }
+        remoteFailCount = 0
 
         authToken = explicitToken.takeIf { it.isNotBlank() }
             ?: localEndpoint.tokenFromUrl
@@ -209,18 +337,98 @@ class MonitorClient(private val context: Context) {
             ?: prefs.authToken
     }
 
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val handle = network.networkHandle
+                val prev = lastNetworkHandle.getAndSet(handle)
+                if (prev == -1L || prev == handle) return
+                Log.i(TAG, "Monitor network changed ($prev -> $handle) — reconnecting immediately")
+                reconnectDelayMs = 1000L
+                remoteFailCount = 0
+                if (remoteEndpoint != null) {
+                    val caps = connectivityManager.getNetworkCapabilities(network)
+                    val hasWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                    tryingRemote = !hasWifi
+                }
+                if (!stopped.get()) {
+                    scope.launch {
+                        delay(250L)
+                        if (!stopped.get()) connectWs()
+                    }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                Log.w(TAG, "Monitor network lost (${network.networkHandle})")
+            }
+        }
+        try {
+            connectivityManager.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+        } catch (e: Exception) {
+            Log.w(TAG, "Monitor NetworkCallback failed: ${e.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        try {
+            connectivityManager.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun startFrameStallWatchdog() {
+        frameStallWatchdogJob?.cancel()
+        frameStallWatchdogJob = scope.launch {
+            while (isActive && !stopped.get()) {
+                delay(3000L)
+                val ui = _uiState.value
+                if (!ui.wsConnected || !ui.cameraOnline) continue
+                val now = SystemClock.elapsedRealtime()
+                if (ui.activeStreamMode == "webrtc" && ui.rtcConnected) {
+                    val last = lastWebRtcFrameMs.get()
+                    if (last > 0L && now - last > FRAME_STALL_TIMEOUT_MS) {
+                        Log.w(TAG, "WebRTC frame stall (>10s) — recovering stream")
+                        if (ui.streamPreference == StreamModePreference.AUTO) {
+                            activateWsRelay(reason = "WebRTC stalled >10s")
+                        } else {
+                            lastWebRtcFrameMs.set(now)
+                            sendWatchRequest()
+                        }
+                    }
+                } else if (ui.activeStreamMode == "ws_relay" && ui.relayConnected) {
+                    val last = lastRelayFrameMs.get()
+                    if (last > 0L && now - last > FRAME_STALL_TIMEOUT_MS) {
+                        Log.w(TAG, "HTTPS Relay frame stall (>10s) — re-requesting relay stream")
+                        lastRelayFrameMs.set(now)
+                        sendWsJson(
+                            PurrJson.encodeToString(
+                                StreamModeMsg(viewerId = clientId, mode = "ws_relay", fps = 8, quality = 60)
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     fun attachVideoSink(sink: VideoSink?) {
         rtcExecutor.execute {
-            videoSink?.let { old ->
+            val track = remoteVideoTrack
+            if (videoSink != null && track != null) {
                 try {
-                    remoteVideoTrack?.removeSink(old)
+                    track.removeSink(frameWatchSink)
                 } catch (_: Exception) {
                 }
             }
             videoSink = sink
-            if (sink != null && remoteVideoTrack != null) {
+            if (sink != null && track != null) {
                 try {
-                    remoteVideoTrack?.addSink(sink)
+                    track.addSink(frameWatchSink)
                 } catch (_: Exception) {
                 }
             }
@@ -245,7 +453,9 @@ class MonitorClient(private val context: Context) {
             if (localTalkbackTrack == null && hasMic && factory != null) {
                 createLocalMicTrackLocked()
                 localTalkbackTrack?.setEnabled(active)
-                sendWatchRequest()
+                if (_uiState.value.activeStreamMode == "webrtc") {
+                    sendWatchRequest()
+                }
             } else {
                 localTalkbackTrack?.setEnabled(active)
             }
@@ -442,7 +652,12 @@ class MonitorClient(private val context: Context) {
         val gen = wsGeneration.incrementAndGet()
         reconnectJob?.cancel()
         pingJob?.cancel()
+        watchTimeoutJob?.cancel()
+        autoRelayFallbackJob?.cancel()
+        iceDisconnectGraceJob?.cancel()
         wsConnected.set(false)
+        watchInFlight.set(false)
+
         val previous = webSocket
         webSocket = null
         try {
@@ -461,6 +676,7 @@ class MonitorClient(private val context: Context) {
         _uiState.update {
             it.copy(
                 wsConnected = false,
+                relayConnected = false,
                 activeRoute = routeLabel,
                 activeHttpBaseUrl = currentEp.httpBaseUrl,
                 statusText = "Connecting ($routeLabel)..."
@@ -474,7 +690,9 @@ class MonitorClient(private val context: Context) {
                     return
                 }
                 wsConnected.set(true)
+                lastWsActivityMs.set(SystemClock.elapsedRealtime())
                 reconnectDelayMs = 1000L
+                remoteFailCount = 0
                 _uiState.update {
                     it.copy(
                         wsConnected = true,
@@ -490,12 +708,13 @@ class MonitorClient(private val context: Context) {
                     token = authToken
                 )
                 webSocket.send(PurrJson.encodeToString(reg))
-                startPingLoop()
+                startPingLoop(gen)
                 refreshSnapshots()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (gen != wsGeneration.get()) return
+                lastWsActivityMs.set(SystemClock.elapsedRealtime())
                 scope.launch { handleMessage(text) }
             }
 
@@ -506,72 +725,166 @@ class MonitorClient(private val context: Context) {
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (gen != wsGeneration.get()) return
                 onWsDisconnected(
-                    reason = if (code == 4001) "Unauthorized token" else "Disconnected ($code)",
-                    immediateFailover = false
+                    reason = when (code) {
+                        4001 -> "Unauthorized token"
+                        4029 -> "Rate limited — cooling down"
+                        else -> "Disconnected ($code)"
+                    },
+                    httpCode = null,
+                    wasRemoteRoute = (routeLabel == "Remote"),
+                    cooldownMs = if (code == 4029) 60_000L else null
                 )
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (gen != wsGeneration.get()) return
-                val canFastFailover = !tryingRemote && remoteEndpoint != null && !wsConnected.get()
                 onWsDisconnected(
                     reason = t.message ?: "Network error",
-                    immediateFailover = canFastFailover
+                    httpCode = response?.code,
+                    wasRemoteRoute = (routeLabel == "Remote"),
+                    cooldownMs = null
                 )
             }
         })
     }
 
-    private fun onWsDisconnected(reason: String, immediateFailover: Boolean) {
+    private fun onWsDisconnected(
+        reason: String,
+        httpCode: Int?,
+        wasRemoteRoute: Boolean,
+        cooldownMs: Long?
+    ) {
         wsConnected.set(false)
         watchInFlight.set(false)
         pingJob?.cancel()
+        watchTimeoutJob?.cancel()
+        autoRelayFallbackJob?.cancel()
+        iceDisconnectGraceJob?.cancel()
         rtcExecutor.execute { closePeerConnectionLocked() }
 
-        if (immediateFailover && remoteEndpoint != null && !stopped.get()) {
+        if (stopped.get()) return
+
+        if (cooldownMs != null) {
+            _uiState.update {
+                it.copy(
+                    wsConnected = false,
+                    rtcConnected = false,
+                    relayConnected = false,
+                    statusText = reason
+                )
+            }
+            reconnectJob?.cancel()
+            reconnectJob = scope.launch {
+                delay(cooldownMs)
+                if (isActive && !stopped.get()) connectWs()
+            }
+            return
+        }
+
+        // Fast failover Local -> Remote when away from home on 4G/5G
+        if (!wasRemoteRoute && remoteEndpoint != null) {
             tryingRemote = true
             _uiState.update {
                 it.copy(
                     wsConnected = false,
                     rtcConnected = false,
+                    relayConnected = false,
                     activeRoute = "Remote",
                     statusText = "Trying Remote tunnel..."
                 )
             }
             scope.launch {
-                delay(150)
+                delay(150L)
                 if (!stopped.get()) connectWs()
             }
             return
         }
 
-        if (remoteEndpoint != null) {
-            tryingRemote = !tryingRemote
+        // Automatic Encrypted Beacon Discovery when Remote tunnel rotated / expired!
+        if (wasRemoteRoute) {
+            remoteFailCount++
+            val isExpiredTunnelHttp = httpCode != null && (httpCode == 404 || httpCode == 502 || httpCode == 503 || httpCode in 520..530)
+            if (authToken.isNotBlank() && (isExpiredTunnelHttp || remoteFailCount >= 2)) {
+                remoteFailCount = 0
+                _uiState.update {
+                    it.copy(
+                        wsConnected = false,
+                        rtcConnected = false,
+                        relayConnected = false,
+                        statusText = "Refreshing remote URL..."
+                    )
+                }
+                reconnectJob?.cancel()
+                reconnectJob = scope.launch {
+                    val fresh = BeaconResolver.resolveLatest(authToken, restClient)
+                    if (fresh != null) {
+                        val parsed = ServerUrlHelper.parse(fresh.wsUrl)
+                        prefs.remoteServerUrl = parsed.wsUrl
+                        if (localEndpoint.isSecure && remoteEndpoint == null) {
+                            localEndpoint = parsed
+                        } else {
+                            remoteEndpoint = parsed
+                        }
+                        reconnectDelayMs = 1000L
+                        if (!stopped.get()) {
+                            connectWs()
+                            return@launch
+                        }
+                    }
+                    // If local is non-secure LAN, alternate back on retry
+                    if (remoteEndpoint != null && !localEndpoint.isSecure) {
+                        tryingRemote = false
+                    }
+                    val wait = reconnectDelayMs
+                    reconnectDelayMs = (reconnectDelayMs * 2).coerceAtMost(8000L)
+                    delay(wait)
+                    if (isActive && !stopped.get()) connectWs()
+                }
+                return
+            }
+            if (remoteEndpoint != null && !localEndpoint.isSecure) {
+                tryingRemote = false
+            }
         }
 
         _uiState.update {
             it.copy(
                 wsConnected = false,
                 rtcConnected = false,
+                relayConnected = false,
                 statusText = "$reason · reconnecting..."
             )
         }
-        if (!stopped.get()) {
-            reconnectJob?.cancel()
-            reconnectJob = scope.launch {
-                val wait = reconnectDelayMs
-                reconnectDelayMs = (reconnectDelayMs * 2).coerceAtMost(8000L)
-                delay(wait)
-                if (isActive && !stopped.get()) connectWs()
-            }
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            val wait = reconnectDelayMs
+            reconnectDelayMs = (reconnectDelayMs * 2).coerceAtMost(8000L)
+            delay(wait)
+            if (isActive && !stopped.get()) connectWs()
         }
     }
 
-    private fun startPingLoop() {
+    private fun startPingLoop(expectedGen: Int) {
         pingJob?.cancel()
         pingJob = scope.launch {
-            while (isActive && wsConnected.get()) {
+            while (isActive && wsConnected.get() && wsGeneration.get() == expectedGen) {
                 delay(15_000L)
+                if (!wsConnected.get() || wsGeneration.get() != expectedGen) break
+                val silentMs = SystemClock.elapsedRealtime() - lastWsActivityMs.get()
+                if (silentMs > WS_PONG_TIMEOUT_MS) {
+                    Log.w(TAG, "Monitor WS pong/activity timeout (${silentMs}ms > 45s) — reconnecting")
+                    try {
+                        webSocket?.cancel()
+                    } catch (_: Exception) {
+                    }
+                    onWsDisconnected(
+                        reason = "Connection timed out",
+                        httpCode = null,
+                        wasRemoteRoute = (_uiState.value.activeRoute == "Remote"),
+                        cooldownMs = null
+                    )
+                    break
+                }
                 sendWsJson(PurrJson.encodeToString(PingPongMsg("ping", System.currentTimeMillis())))
             }
         }
@@ -620,12 +933,56 @@ class MonitorClient(private val context: Context) {
                         statusText = if (online) "Camera online" else "Camera offline"
                     )
                 }
-                if (online && (!wasOnline || (peerConnection == null && !watchInFlight.get()))) {
-                    sendWatchRequest()
-                } else if (!online) {
+                if (online) {
+                    val pref = _uiState.value.streamPreference
+                    if (pref == StreamModePreference.WS_RELAY) {
+                        if (!_uiState.value.relayConnected || !wasOnline) {
+                            activateWsRelay(reason = "User preference HTTPS Relay")
+                        }
+                    } else if (_uiState.value.activeStreamMode == "ws_relay" && wasOnline) {
+                        // Already streaming via HTTPS Relay; keep it uninterrupted
+                    } else if (!wasOnline || (peerConnection == null && !watchInFlight.get())) {
+                        sendWatchRequest()
+                    }
+                } else {
                     watchInFlight.set(false)
+                    watchTimeoutJob?.cancel()
+                    autoRelayFallbackJob?.cancel()
+                    iceDisconnectGraceJob?.cancel()
                     rtcExecutor.execute { closePeerConnectionLocked() }
-                    _uiState.update { it.copy(rtcConnected = false) }
+                    _uiState.update {
+                        it.copy(
+                            rtcConnected = false,
+                            relayConnected = false,
+                            relayFrame = null
+                        )
+                    }
+                }
+            }
+
+            "video_frame" -> {
+                val dataB64 = obj["data"]?.jsonPrimitive?.contentOrNull ?: return
+                lastRelayFrameMs.set(SystemClock.elapsedRealtime())
+                if (!relayDecodeInFlight.compareAndSet(false, true)) return
+                scope.launch(Dispatchers.Default) {
+                    try {
+                        val bytes = Base64.getDecoder().decode(dataB64)
+                        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (bmp != null) {
+                            val img = bmp.asImageBitmap()
+                            _uiState.update {
+                                it.copy(
+                                    activeStreamMode = "ws_relay",
+                                    relayConnected = true,
+                                    relayFrame = img,
+                                    statusText = "Live · HTTPS Relay"
+                                )
+                            }
+                        }
+                    } catch (_: Exception) {
+                    } finally {
+                        relayDecodeInFlight.set(false)
+                    }
                 }
             }
 
@@ -723,11 +1080,47 @@ class MonitorClient(private val context: Context) {
     private fun sendWatchRequest() {
         if (!wsConnected.get()) return
         watchInFlight.set(true)
+        lastWebRtcFrameMs.set(0L)
         sendWsJson(PurrJson.encodeToString(WatchRequestMsg(viewerId = clientId)))
+
+        // 8-second watchInFlight deadlock watchdog
+        watchTimeoutJob?.cancel()
+        watchTimeoutJob = scope.launch {
+            delay(8_000L)
+            if (watchInFlight.compareAndSet(true, false) && wsConnected.get() && _uiState.value.cameraOnline) {
+                Log.w(TAG, "watch_request offer timeout (8s) — recovering")
+                if (_uiState.value.streamPreference == StreamModePreference.AUTO) {
+                    activateWsRelay(reason = "No WebRTC offer within 8s")
+                } else {
+                    sendWatchRequest()
+                }
+            }
+        }
+
+        // 6-second automatic HTTPS Relay fallback on Remote connections in Auto mode
+        autoRelayFallbackJob?.cancel()
+        if (_uiState.value.streamPreference == StreamModePreference.AUTO &&
+            _uiState.value.activeRoute == "Remote"
+        ) {
+            autoRelayFallbackJob = scope.launch {
+                delay(6_000L)
+                val ui = _uiState.value
+                val gotFrame = lastWebRtcFrameMs.get() > 0L
+                if (wsConnected.get() && ui.cameraOnline && ui.activeStreamMode == "webrtc" &&
+                    (!ui.rtcConnected || !gotFrame)
+                ) {
+                    activateWsRelay(reason = "Remote WebRTC did not deliver frames within 6s")
+                }
+            }
+        }
     }
 
     private fun handleRtcOffer(sdp: String) {
         watchInFlight.set(false)
+        watchTimeoutJob?.cancel()
+        if (_uiState.value.activeStreamMode == "ws_relay") {
+            return
+        }
         rtcExecutor.execute {
             if (stopped.get()) return@execute
             ensureRtcFactory()
@@ -748,22 +1141,50 @@ class MonitorClient(private val context: Context) {
                         Log.d(TAG, "Monitor ICE state: $state")
                         val connected = state == PeerConnection.IceConnectionState.CONNECTED ||
                             state == PeerConnection.IceConnectionState.COMPLETED
+
+                        if (connected) {
+                            iceDisconnectGraceJob?.cancel()
+                            lastWebRtcFrameMs.set(SystemClock.elapsedRealtime())
+                        }
+
                         _uiState.update {
                             it.copy(
                                 rtcConnected = connected,
                                 statusText = when {
                                     connected -> "Live"
                                     state == PeerConnection.IceConnectionState.CHECKING -> "Connecting video..."
-                                    state == PeerConnection.IceConnectionState.FAILED -> "Reconnecting video..."
+                                    state == PeerConnection.IceConnectionState.DISCONNECTED -> "Reconnecting video..."
+                                    state == PeerConnection.IceConnectionState.FAILED -> "Video interrupted..."
                                     else -> it.statusText
                                 }
                             )
                         }
-                        if (state == PeerConnection.IceConnectionState.FAILED && _uiState.value.cameraOnline) {
+
+                        if (state == PeerConnection.IceConnectionState.DISCONNECTED) {
+                            iceDisconnectGraceJob?.cancel()
+                            iceDisconnectGraceJob = scope.launch {
+                                delay(5_000L)
+                                if (wsConnected.get() && _uiState.value.cameraOnline &&
+                                    !_uiState.value.rtcConnected && peerConnection === createdPc
+                                ) {
+                                    Log.w(TAG, "Monitor ICE DISCONNECTED >5s — triggering recovery")
+                                    if (_uiState.value.streamPreference == StreamModePreference.AUTO) {
+                                        activateWsRelay(reason = "ICE disconnected >5s")
+                                    } else {
+                                        sendWatchRequest()
+                                    }
+                                }
+                            }
+                        } else if (state == PeerConnection.IceConnectionState.FAILED && _uiState.value.cameraOnline) {
+                            iceDisconnectGraceJob?.cancel()
                             scope.launch {
-                                delay(1500)
-                                if (wsConnected.get() && _uiState.value.cameraOnline && peerConnection === createdPc) {
-                                    sendWatchRequest()
+                                if (_uiState.value.streamPreference == StreamModePreference.AUTO) {
+                                    activateWsRelay(reason = "ICE failed")
+                                } else {
+                                    delay(1500L)
+                                    if (wsConnected.get() && _uiState.value.cameraOnline && peerConnection === createdPc) {
+                                        sendWatchRequest()
+                                    }
                                 }
                             }
                         }
@@ -807,9 +1228,9 @@ class MonitorClient(private val context: Context) {
                             is VideoTrack -> {
                                 remoteVideoTrack = track
                                 track.setEnabled(true)
-                                videoSink?.let { sink ->
+                                if (videoSink != null) {
                                     try {
-                                        track.addSink(sink)
+                                        track.addSink(frameWatchSink)
                                     } catch (_: Exception) {
                                     }
                                 }
@@ -928,11 +1349,9 @@ class MonitorClient(private val context: Context) {
     }
 
     private fun closePeerConnectionLocked() {
-        videoSink?.let { sink ->
-            try {
-                remoteVideoTrack?.removeSink(sink)
-            } catch (_: Exception) {
-            }
+        try {
+            remoteVideoTrack?.removeSink(frameWatchSink)
+        } catch (_: Exception) {
         }
         remoteVideoTrack = null
         remoteAudioTrack = null
@@ -950,10 +1369,18 @@ class MonitorClient(private val context: Context) {
         if (!stopped.compareAndSet(false, true)) return
         wsGeneration.incrementAndGet()
         if (wsConnected.get()) {
+            if (_uiState.value.activeStreamMode == "ws_relay") {
+                sendWsJson(PurrJson.encodeToString(StreamModeMsg(viewerId = clientId, mode = "webrtc")))
+            }
             sendWsJson(PurrJson.encodeToString(WatchStopMsg(viewerId = clientId)))
         }
         reconnectJob?.cancel()
         pingJob?.cancel()
+        watchTimeoutJob?.cancel()
+        autoRelayFallbackJob?.cancel()
+        iceDisconnectGraceJob?.cancel()
+        frameStallWatchdogJob?.cancel()
+        unregisterNetworkCallback()
         wsConnected.set(false)
         try {
             webSocket?.close(1000, "viewer_closed")
@@ -985,5 +1412,7 @@ class MonitorClient(private val context: Context) {
 
     companion object {
         private const val TAG = "PurrCamMonitor"
+        private const val WS_PONG_TIMEOUT_MS = 45_000L
+        private const val FRAME_STALL_TIMEOUT_MS = 10_000L
     }
 }

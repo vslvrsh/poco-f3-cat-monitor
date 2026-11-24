@@ -152,13 +152,22 @@ data class IceCandidateDto(
 )
 
 @Serializable
+data class RemoteBeaconDto(
+    val enabled: Boolean = false,
+    val lastPublishedAt: Long? = null,
+    val endpoints: List<String> = emptyList()
+)
+
+@Serializable
 data class RemoteStatusDto(
     val enabled: Boolean = false,
     val status: String = "stopped", // "stopped" | "starting" | "running" | "error"
-    val provider: String = "none", // "cloudflare" | "tailscale" | "custom" | "none"
+    val provider: String = "none", // "auto" | "localhost.run" | "pinggy" | "cloudflare" | "tailscale" | "custom" | "none"
+    val activeProvider: String? = null,
     val url: String? = null,
     val wsUrl: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    val beacon: RemoteBeaconDto? = null
 )
 
 @Serializable
@@ -267,6 +276,26 @@ data class RtcIceMsg(
 data class PingPongMsg(
     val type: String,
     val ts: Long
+)
+
+@Serializable
+data class StreamModeMsg(
+    val type: String = "stream_mode",
+    val viewerId: String? = null,
+    val mode: String, // "webrtc" | "ws_relay"
+    val fps: Int? = null,
+    val quality: Int? = null
+)
+
+@Serializable
+data class VideoFrameMsg(
+    val type: String = "video_frame",
+    val ts: Long,
+    val width: Int,
+    val height: Int,
+    val lensLabel: String? = null,
+    val mime: String = "image/jpeg",
+    val data: String
 )
 
 data class ParsedServerEndpoint(

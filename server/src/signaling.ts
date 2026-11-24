@@ -19,8 +19,11 @@ import type {
   RemoteStatus,
   SnapshotMeta,
   StateUpdateMessage,
+  StreamMode,
+  StreamModeMessage,
   Telemetry,
   TelemetryMessage,
+  VideoFrameMessage,
   ViewerClientType,
   ViewerRegisterMessage,
   CameraRegisterMessage,
@@ -34,11 +37,13 @@ const DEFAULT_CAPABILITIES: CameraCapabilities = {
   chargeLimit: false,
 };
 
+const RELAY_BACKPRESSURE_LIMIT_BYTES = 512 * 1024;
+
 interface PeerMeta {
   ws: WebSocket;
   role: "camera" | "viewer" | null;
   id: string | null;
-  isAlive: boolean;
+  missedPings: number;
   lastSeen: number;
   connectedAt: number;
   isExternal: boolean;
@@ -64,6 +69,7 @@ interface ViewerPeer extends PeerMeta {
   id: string;
   clientName: string;
   clientType: ViewerClientType;
+  streamMode: StreamMode;
 }
 
 interface PendingCommand {
@@ -82,6 +88,7 @@ export interface SignalingHubOptions {
   rateLimiter: AuthRateLimiter;
   onLog?: (msg: string) => void;
   heartbeatIntervalMs?: number;
+  heartbeatMaxMissed?: number;
   registerTimeoutMs?: number;
   commandTimeoutMs?: number;
 }
@@ -119,6 +126,7 @@ export class SignalingHub {
   private readonly rateLimiter: AuthRateLimiter;
   private readonly onLog?: (msg: string) => void;
   private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatMaxMissed: number;
   private readonly registerTimeoutMs: number;
   private readonly commandTimeoutMs: number;
 
@@ -136,10 +144,11 @@ export class SignalingHub {
     this.rateLimiter = options.rateLimiter;
     this.onLog = options.onLog;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15_000;
+    this.heartbeatMaxMissed = Math.max(1, options.heartbeatMaxMissed ?? 3);
     this.registerTimeoutMs = options.registerTimeoutMs ?? 15_000;
     this.commandTimeoutMs = options.commandTimeoutMs ?? 30_000;
 
-    this.wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
     this.wss.on("connection", (ws, req) => this.handleConnection(ws, req));
 
     this.heartbeatTimer = setInterval(() => {
@@ -232,7 +241,7 @@ export class SignalingHub {
       ws,
       role: null,
       id: null,
-      isAlive: true,
+      missedPings: 0,
       lastSeen: now,
       connectedAt: now,
       isExternal: isExternalRequest(req),
@@ -255,12 +264,12 @@ export class SignalingHub {
     this.peers.set(ws, peer);
 
     ws.on("pong", () => {
-      peer.isAlive = true;
+      peer.missedPings = 0;
       peer.lastSeen = Date.now();
     });
 
     ws.on("message", (raw) => {
-      peer.isAlive = true;
+      peer.missedPings = 0;
       peer.lastSeen = Date.now();
       this.handleRawMessage(peer, raw);
     });
@@ -332,6 +341,12 @@ export class SignalingHub {
         break;
       case "watch_stop":
         this.handleWatchStop(peer);
+        break;
+      case "stream_mode":
+        this.handleStreamMode(peer, parsed as unknown as StreamModeMessage);
+        break;
+      case "video_frame":
+        this.handleVideoFrame(peer, parsed as unknown as VideoFrameMessage);
         break;
       case "rtc_offer":
         this.handleRtcOffer(peer, parsed);
@@ -486,7 +501,7 @@ export class SignalingHub {
       iceServers: this.getIceServers(),
     });
 
-    // Notify camera about viewers already connected
+    // Notify camera about viewers already connected (and any active ws_relay mode)
     for (const viewer of this.viewers.values()) {
       safeSend(cameraPeer.ws, {
         type: "viewer_joined",
@@ -494,6 +509,13 @@ export class SignalingHub {
         clientName: viewer.clientName,
         clientType: viewer.clientType,
       });
+      if (viewer.streamMode === "ws_relay") {
+        safeSend(cameraPeer.ws, {
+          type: "stream_mode",
+          viewerId: viewer.id,
+          mode: "ws_relay",
+        });
+      }
     }
 
     this.broadcastCameraStatus();
@@ -527,6 +549,7 @@ export class SignalingHub {
       id: viewerId,
       clientName,
       clientType,
+      streamMode: "webrtc" as StreamMode,
     });
 
     this.viewers.set(viewerId, viewerPeer);
@@ -586,11 +609,101 @@ export class SignalingHub {
 
   private handleWatchStop(peer: PeerMeta): void {
     if (peer.role !== "viewer" || !peer.id) return;
+    const viewer = this.viewers.get(peer.id);
+    if (viewer && viewer.streamMode === "ws_relay") {
+      viewer.streamMode = "webrtc";
+      if (this.camera && this.camera.ws.readyState === WebSocket.OPEN) {
+        safeSend(this.camera.ws, {
+          type: "stream_mode",
+          viewerId: peer.id,
+          mode: "webrtc",
+        });
+      }
+    }
     if (this.camera && this.camera.ws.readyState === WebSocket.OPEN) {
       safeSend(this.camera.ws, {
         type: "watch_stop",
         viewerId: peer.id,
       });
+    }
+  }
+
+  private handleStreamMode(peer: PeerMeta, msg: StreamModeMessage): void {
+    if (peer.role !== "viewer" || !peer.id) {
+      safeSend(peer.ws, {
+        type: "error",
+        code: "forbidden",
+        message: "Only viewers can send stream_mode",
+      });
+      return;
+    }
+
+    const mode = msg.mode;
+    if (mode !== "webrtc" && mode !== "ws_relay") {
+      safeSend(peer.ws, {
+        type: "error",
+        code: "BAD_MESSAGE",
+        message: "stream_mode requires mode 'webrtc' or 'ws_relay'",
+      });
+      return;
+    }
+
+    const viewer = this.viewers.get(peer.id);
+    if (viewer) {
+      viewer.streamMode = mode;
+    }
+
+    if (this.camera && this.camera.ws.readyState === WebSocket.OPEN) {
+      safeSend(this.camera.ws, {
+        type: "stream_mode",
+        viewerId: peer.id,
+        mode,
+        ...(typeof msg.fps === "number" ? { fps: msg.fps } : {}),
+        ...(typeof msg.quality === "number" ? { quality: msg.quality } : {}),
+      });
+    }
+  }
+
+  private handleVideoFrame(peer: PeerMeta, msg: VideoFrameMessage): void {
+    if (peer.role !== "camera" || this.camera?.ws !== peer.ws) {
+      safeSend(peer.ws, {
+        type: "error",
+        code: "forbidden",
+        message: "Only the active camera can send video_frame",
+      });
+      return;
+    }
+
+    if (typeof msg.data !== "string" || msg.data.length === 0) {
+      return;
+    }
+
+    let serialized: string | null = null;
+    for (const viewer of this.viewers.values()) {
+      if (viewer.streamMode !== "ws_relay") continue;
+      if (viewer.ws.readyState !== WebSocket.OPEN) continue;
+      // Backpressure protection: drop frame for congested relay viewers
+      if (viewer.ws.bufferedAmount >= RELAY_BACKPRESSURE_LIMIT_BYTES) {
+        continue;
+      }
+      if (serialized === null) {
+        serialized = JSON.stringify({
+          type: "video_frame",
+          ts: typeof msg.ts === "number" ? msg.ts : Date.now(),
+          width: typeof msg.width === "number" ? msg.width : 0,
+          height: typeof msg.height === "number" ? msg.height : 0,
+          ...(typeof msg.lensLabel === "string"
+            ? { lensLabel: msg.lensLabel }
+            : {}),
+          mime: typeof msg.mime === "string" ? msg.mime : "image/jpeg",
+          data: msg.data,
+        });
+      }
+      try {
+        viewer.ws.send(serialized);
+      } catch {
+        // ignore send errors on closing socket
+      }
     }
   }
 
@@ -900,6 +1013,7 @@ export class SignalingHub {
     if (peer.role === "viewer" && peer.id) {
       const current = this.viewers.get(peer.id);
       if (current && current.ws === peer.ws) {
+        const wasRelay = current.streamMode === "ws_relay";
         this.viewers.delete(peer.id);
         this.onLog?.(`[Signaling] Viewer disconnected (${peer.id})`);
         for (const [cmdId, pending] of this.pendingCommands.entries()) {
@@ -909,6 +1023,13 @@ export class SignalingHub {
           }
         }
         if (this.camera && this.camera.ws.readyState === WebSocket.OPEN) {
+          if (wasRelay) {
+            safeSend(this.camera.ws, {
+              type: "stream_mode",
+              viewerId: peer.id,
+              mode: "webrtc",
+            });
+          }
           safeSend(this.camera.ws, {
             type: "viewer_left",
             viewerId: peer.id,
@@ -946,11 +1067,11 @@ export class SignalingHub {
 
   private runHeartbeatSweep(): void {
     for (const [ws, peer] of this.peers.entries()) {
-      if (!peer.isAlive) {
+      if (peer.missedPings >= this.heartbeatMaxMissed) {
         ws.terminate();
         continue;
       }
-      peer.isAlive = false;
+      peer.missedPings += 1;
       try {
         ws.ping();
       } catch {

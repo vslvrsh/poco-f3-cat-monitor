@@ -10,15 +10,20 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.purrcam.app.MainActivity
 import com.purrcam.app.data.AppPreferences
+import com.purrcam.app.monitor.BeaconResolver
 import com.purrcam.app.protocol.CameraCapabilities
 import com.purrcam.app.protocol.CameraState
 import com.purrcam.app.protocol.CommandAckMsg
@@ -35,6 +40,7 @@ import com.purrcam.app.protocol.ServerUrlHelper
 import com.purrcam.app.protocol.StateUpdateMsg
 import com.purrcam.app.protocol.Telemetry
 import com.purrcam.app.protocol.TelemetryMsg
+import com.purrcam.app.protocol.VideoFrameMsg
 import com.purrcam.app.root.RootPowerController
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,9 +75,11 @@ import okhttp3.WebSocketListener
 import org.webrtc.EglBase
 import org.webrtc.VideoSink
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 data class CameraServiceUiState(
@@ -87,6 +95,7 @@ data class CameraServiceUiState(
     val cameraState: CameraState = CameraState(),
     val telemetry: Telemetry? = null,
     val viewerCount: Int = 0,
+    val relayActive: Boolean = false,
     val lastError: String? = null
 )
 
@@ -96,12 +105,13 @@ class CameraStreamService : Service() {
     private lateinit var prefs: AppPreferences
     private val rootController = RootPowerController()
     private lateinit var telemetryCollector: TelemetryCollector
+    private lateinit var connectivityManager: ConnectivityManager
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
         .build()
 
     // Fast 2.5s connect client for Local LAN probe when Remote failover is also configured
@@ -111,19 +121,27 @@ class CameraStreamService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val lastNetworkHandle = AtomicLong(-1L)
 
     private var webRtcManager: CameraWebRtcManager? = null
+    private var relayEncoder: RelayFrameEncoder? = null
+    private val relayViewers = ConcurrentHashMap.newKeySet<String>()
+    private var webrtcViewerCount = 0
     private var lensDescriptors: List<LensDescriptor> = emptyList()
 
     private var localEndpoint: ParsedServerEndpoint = ServerUrlHelper.parse(ServerUrlHelper.DEFAULT_LOCAL_URL)
     private var remoteEndpoint: ParsedServerEndpoint? = null
     private var activeEndpoint: ParsedServerEndpoint = localEndpoint
     private var tryingRemote = false
+    private var localFailCount = 0
+    private var remoteFailCount = 0
     private var authToken: String = ""
 
     @Volatile
     private var webSocket: WebSocket? = null
     private val wsGeneration = AtomicInteger(0)
+    private val lastWsActivityMs = AtomicLong(0L)
     private var wsReconnectJob: Job? = null
     private var telemetryJob: Job? = null
     private var pingJob: Job? = null
@@ -138,6 +156,7 @@ class CameraStreamService : Service() {
         activeInstance.set(this)
         prefs = AppPreferences(this)
         telemetryCollector = TelemetryCollector(this, rootController)
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         createNotificationChannel()
     }
 
@@ -188,6 +207,8 @@ class CameraStreamService : Service() {
             tryingRemote = false
             activeEndpoint = localEndpoint
         }
+        localFailCount = 0
+        remoteFailCount = 0
 
         authToken = explicitToken?.takeIf { it.isNotBlank() }
             ?: localEndpoint.tokenFromUrl
@@ -205,6 +226,7 @@ class CameraStreamService : Service() {
 
     private fun initializePipeline(startBlackout: Boolean) {
         acquireLocks()
+        registerNetworkCallback()
         uiStateFlow.update {
             it.copy(
                 running = true,
@@ -219,6 +241,9 @@ class CameraStreamService : Service() {
 
         serviceScope.launch {
             val rootCaps = rootController.probe()
+            if (rootCaps.hasRoot) {
+                rootController.whitelistDozeIfRooted()
+            }
 
             val descriptors = LensEnumerator.enumerate(this@CameraStreamService)
             lensDescriptors = descriptors
@@ -277,8 +302,8 @@ class CameraStreamService : Service() {
                     sendWsJson(PurrJson.encodeToString(RtcIceMsg(viewerId = viewerId, candidate = candidate)))
                 },
                 onViewerCountChanged = { count ->
-                    uiStateFlow.update { it.copy(viewerCount = count) }
-                    updateNotification()
+                    webrtcViewerCount = count
+                    updateEffectiveViewerCount()
                 },
                 onCameraError = { err ->
                     Log.e(TAG, "Camera error: $err")
@@ -287,6 +312,27 @@ class CameraStreamService : Service() {
             )
             webRtcManager = manager
             manager.start(w, h, currentState.fps, currentState.bitrateKbps)
+
+            relayEncoder = RelayFrameEncoder(
+                canSendFrame = {
+                    wsConnected.get() &&
+                        relayViewers.isNotEmpty() &&
+                        (webSocket?.queueSize() ?: Long.MAX_VALUE) <= RELAY_BACKPRESSURE_LIMIT_BYTES
+                },
+                onFrameEncoded = { width, height, base64Jpeg ->
+                    if (!wsConnected.get() || relayViewers.isEmpty()) return@RelayFrameEncoder
+                    val lensLabel = lensDescriptors.firstOrNull { it.info.id == currentState.activeLensId }?.info?.label
+                    val msg = VideoFrameMsg(
+                        ts = System.currentTimeMillis(),
+                        width = width,
+                        height = height,
+                        lensLabel = lensLabel,
+                        mime = "image/jpeg",
+                        data = base64Jpeg
+                    )
+                    sendWsJson(PurrJson.encodeToString(msg))
+                }
+            )
 
             uiStateFlow.update {
                 it.copy(
@@ -301,6 +347,71 @@ class CameraStreamService : Service() {
 
             connectWebSocket()
             startTelemetryLoop()
+        }
+    }
+
+    private fun updateEffectiveViewerCount() {
+        val total = maxOf(webrtcViewerCount, relayViewers.size)
+        uiStateFlow.update {
+            it.copy(
+                viewerCount = total,
+                relayActive = relayViewers.isNotEmpty()
+            )
+        }
+        updateNotification()
+    }
+
+    private fun syncRelayAttachment() {
+        val encoder = relayEncoder ?: return
+        if (relayViewers.isNotEmpty()) {
+            webRtcManager?.attachRelaySink(encoder)
+        } else {
+            webRtcManager?.attachRelaySink(null)
+        }
+        updateEffectiveViewerCount()
+    }
+
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val handle = network.networkHandle
+                val prev = lastNetworkHandle.getAndSet(handle)
+                if (prev == -1L || prev == handle) return
+                Log.i(TAG, "Network changed ($prev -> $handle) — triggering instant WS reconnect")
+                reconnectDelayMs = 1000L
+                localFailCount = 0
+                if (remoteEndpoint != null) {
+                    val caps = connectivityManager.getNetworkCapabilities(network)
+                    val hasWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                    tryingRemote = !hasWifi
+                }
+                if (uiStateFlow.value.running) {
+                    serviceScope.launch {
+                        delay(300L)
+                        if (uiStateFlow.value.running) connectWebSocket()
+                    }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                Log.w(TAG, "Network lost (${network.networkHandle})")
+            }
+        }
+        try {
+            connectivityManager.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register NetworkCallback: ${e.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        try {
+            connectivityManager.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
         }
     }
 
@@ -345,6 +456,9 @@ class CameraStreamService : Service() {
         wsReconnectJob?.cancel()
         pingJob?.cancel()
         wsConnected.set(false)
+        relayViewers.clear()
+        syncRelayAttachment()
+
         val previous = webSocket
         webSocket = null
         try {
@@ -380,7 +494,10 @@ class CameraStreamService : Service() {
                 }
                 Log.i(TAG, "WS connected ($routeLabel) to ${currentEp.wsUrl}")
                 wsConnected.set(true)
+                lastWsActivityMs.set(SystemClock.elapsedRealtime())
                 reconnectDelayMs = 1000L
+                localFailCount = 0
+                remoteFailCount = 0
                 uiStateFlow.update {
                     it.copy(
                         wsConnected = true,
@@ -391,12 +508,13 @@ class CameraStreamService : Service() {
                     )
                 }
                 sendRegistration(webSocket)
-                startPingLoop()
+                startPingLoop(gen)
                 updateNotification()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (gen != wsGeneration.get()) return
+                lastWsActivityMs.set(SystemClock.elapsedRealtime())
                 serviceScope.launch {
                     handleIncomingWsMessage(text)
                 }
@@ -411,46 +529,83 @@ class CameraStreamService : Service() {
                 Log.w(TAG, "WS closed ($code): $reason")
                 onSocketLost(
                     reason = if (code == 4001) "Unauthorized token" else "Disconnected ($code)",
-                    immediateFailover = false
+                    httpCode = null,
+                    wasRemoteRoute = (routeLabel == "Remote")
                 )
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (gen != wsGeneration.get()) return
-                Log.w(TAG, "WS failure ($routeLabel): ${t.message}")
-                val canFastFailover = !tryingRemote && remoteEndpoint != null && !wsConnected.get()
+                val code = response?.code
+                Log.w(TAG, "WS failure ($routeLabel, http=$code): ${t.message}")
                 onSocketLost(
                     reason = t.message ?: "Network error",
-                    immediateFailover = canFastFailover
+                    httpCode = code,
+                    wasRemoteRoute = (routeLabel == "Remote")
                 )
             }
         })
     }
 
-    private fun onSocketLost(reason: String, immediateFailover: Boolean) {
+    private fun onSocketLost(reason: String, httpCode: Int?, wasRemoteRoute: Boolean) {
         wsConnected.set(false)
         pingJob?.cancel()
+        relayViewers.clear()
+        syncRelayAttachment()
 
-        // If Local timed out / refused and a Remote URL is configured, immediately fail over to Remote!
-        if (immediateFailover && remoteEndpoint != null) {
-            tryingRemote = true
-            uiStateFlow.update {
-                it.copy(
-                    wsConnected = false,
-                    activeRoute = "Remote",
-                    statusText = "Switching to Remote..."
-                )
+        if (!wasRemoteRoute) {
+            localFailCount++
+            // Camera LAN Stickiness: retry Local LAN twice before falling over to Remote!
+            if (remoteEndpoint != null && localFailCount >= 2) {
+                localFailCount = 0
+                tryingRemote = true
+                uiStateFlow.update {
+                    it.copy(
+                        wsConnected = false,
+                        activeRoute = "Remote",
+                        statusText = "Switching to Remote..."
+                    )
+                }
+                serviceScope.launch {
+                    delay(200L)
+                    if (uiStateFlow.value.running) connectWebSocket()
+                }
+                return
             }
-            serviceScope.launch {
-                delay(150)
-                if (uiStateFlow.value.running) connectWebSocket()
+        } else {
+            remoteFailCount++
+            val isExpiredTunnelHttp = httpCode != null && (httpCode == 404 || httpCode == 502 || httpCode == 503 || httpCode in 520..530)
+            if (authToken.isNotBlank() && (isExpiredTunnelHttp || remoteFailCount >= 2)) {
+                remoteFailCount = 0
+                serviceScope.launch {
+                    uiStateFlow.update { it.copy(statusText = "Refreshing remote URL...") }
+                    val fresh = BeaconResolver.resolveLatest(authToken, httpClient)
+                    if (fresh != null) {
+                        val parsed = ServerUrlHelper.parse(fresh.wsUrl)
+                        prefs.remoteServerUrl = parsed.wsUrl
+                        if (localEndpoint.isSecure && remoteEndpoint == null) {
+                            localEndpoint = parsed
+                        } else {
+                            remoteEndpoint = parsed
+                        }
+                        reconnectDelayMs = 1000L
+                        if (uiStateFlow.value.running) {
+                            connectWebSocket()
+                            return@launch
+                        }
+                    }
+                    // Fall back to Local if available, else schedule standard backoff reconnect
+                    if (remoteEndpoint != null && !localEndpoint.isSecure) {
+                        tryingRemote = false
+                    }
+                    scheduleReconnect()
+                }
+                return
             }
-            return
-        }
-
-        // Alternate between Local and Remote on subsequent retries if both exist
-        if (remoteEndpoint != null) {
-            tryingRemote = !tryingRemote
+            // Alternate back to Local after failed Remote attempt if Local is non-secure LAN
+            if (remoteEndpoint != null && !localEndpoint.isSecure) {
+                tryingRemote = false
+            }
         }
 
         uiStateFlow.update {
@@ -480,11 +635,27 @@ class CameraStreamService : Service() {
         connectWebSocket()
     }
 
-    private fun startPingLoop() {
+    private fun startPingLoop(expectedGen: Int) {
         pingJob?.cancel()
         pingJob = serviceScope.launch {
-            while (isActive && wsConnected.get()) {
+            while (isActive && wsConnected.get() && wsGeneration.get() == expectedGen) {
                 delay(15_000L)
+                if (!wsConnected.get() || wsGeneration.get() != expectedGen) break
+
+                val silentMs = SystemClock.elapsedRealtime() - lastWsActivityMs.get()
+                if (silentMs > WS_PONG_TIMEOUT_MS) {
+                    Log.w(TAG, "WS pong/activity timeout (${silentMs}ms > 45s) — forcing reconnect")
+                    try {
+                        webSocket?.cancel()
+                    } catch (_: Exception) {
+                    }
+                    onSocketLost(
+                        reason = "Connection timed out",
+                        httpCode = null,
+                        wasRemoteRoute = (uiStateFlow.value.activeRoute == "Remote")
+                    )
+                    break
+                }
                 sendWsJson(PurrJson.encodeToString(PingPongMsg(type = "ping", ts = System.currentTimeMillis())))
             }
         }
@@ -536,6 +707,29 @@ class CameraStreamService : Service() {
                 val viewerId = obj["viewerId"]?.jsonPrimitive?.contentOrNull ?: return
                 Log.i(TAG, "$type for $viewerId")
                 webRtcManager?.handleViewerRemoved(viewerId)
+                if (relayViewers.remove(viewerId)) {
+                    syncRelayAttachment()
+                }
+            }
+
+            "stream_mode" -> {
+                val viewerId = obj["viewerId"]?.jsonPrimitive?.contentOrNull
+                val mode = obj["mode"]?.jsonPrimitive?.contentOrNull?.lowercase() ?: return
+                val fps = obj["fps"]?.jsonPrimitive?.intOrNull
+                val quality = obj["quality"]?.jsonPrimitive?.intOrNull
+                Log.i(TAG, "stream_mode viewer=$viewerId mode=$mode fps=$fps quality=$quality")
+                if (mode == "ws_relay") {
+                    relayEncoder?.updateParams(fps, quality)
+                    relayViewers.add(viewerId ?: "__relay__")
+                    syncRelayAttachment()
+                } else {
+                    if (viewerId != null) {
+                        relayViewers.remove(viewerId)
+                    } else {
+                        relayViewers.clear()
+                    }
+                    syncRelayAttachment()
+                }
             }
 
             "rtc_answer" -> {
@@ -565,6 +759,10 @@ class CameraStreamService : Service() {
             "ping" -> {
                 val ts = obj["ts"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: System.currentTimeMillis()
                 sendWsJson(PurrJson.encodeToString(PingPongMsg(type = "pong", ts = ts)))
+            }
+
+            "pong" -> {
+                // Already recorded via lastWsActivityMs
             }
 
             "error" -> {
@@ -932,9 +1130,10 @@ class CameraStreamService : Service() {
 
     private fun startAsForeground(contentText: String) {
         val notification = buildNotification(contentText)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            var serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        // Android 15-17 strictly caps FOREGROUND_SERVICE_TYPE_DATA_SYNC at 6 hours/day;
+        // use ONLY camera | microphone so 24/7 monitoring is never terminated by the OS.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            var serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
             val hasMic = ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.RECORD_AUDIO
@@ -943,12 +1142,6 @@ class CameraStreamService : Service() {
                 serviceType = serviceType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             }
             startForeground(NOTIFICATION_ID, notification, serviceType)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
@@ -1005,6 +1198,13 @@ class CameraStreamService : Service() {
         telemetryJob?.cancel()
         pingJob?.cancel()
         wsConnected.set(false)
+        unregisterNetworkCallback()
+
+        relayViewers.clear()
+        webRtcManager?.attachRelaySink(null)
+        relayEncoder?.close()
+        relayEncoder = null
+
         try {
             webSocket?.close(1000, "service_stopped")
         } catch (_: Exception) {
@@ -1026,6 +1226,7 @@ class CameraStreamService : Service() {
                 videoReady = false,
                 wsConnected = false,
                 viewerCount = 0,
+                relayActive = false,
                 statusText = "Stopped",
                 cameraState = it.cameraState.copy(blackout = false, rootDisplayOff = false, streaming = false)
             )
@@ -1038,6 +1239,8 @@ class CameraStreamService : Service() {
         private const val TAG = "PurrCamService"
         private const val CHANNEL_ID = "purrcam_camera_channel"
         private const val NOTIFICATION_ID = 8787
+        private const val WS_PONG_TIMEOUT_MS = 45_000L
+        private const val RELAY_BACKPRESSURE_LIMIT_BYTES = 256L * 1024L
 
         const val ACTION_START = "com.purrcam.app.action.START_CAMERA"
         const val ACTION_STOP = "com.purrcam.app.action.STOP_CAMERA"

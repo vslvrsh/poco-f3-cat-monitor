@@ -1,6 +1,6 @@
-# PurrCam Protocol v1.1
+# PurrCam Protocol v1.2
 
-> Shared wire contract for **PurrCam** — self-hosted cat baby monitor connecting a rooted **Poco F3** camera node, a **PC Hub Server**, a **PC Web/Desktop Monitor**, and an **Android Monitor** app over Local LAN, USB (`adb reverse`), or Remote 4G/5G (Cloudflare Tunnel / Tailscale / Custom HTTPS + TURN).
+> Shared wire contract for **PurrCam** — self-hosted cat baby monitor connecting a rooted **Poco F3** camera node, a **PC Hub Server**, a **PC Web/Desktop Monitor**, and an **Android Monitor** app over Local LAN, USB (`adb reverse`), or Remote 4G/5G (Zero-Signup VPN-Free Tunnels `localhost.run` / `Pinggy :443` / `Cloudflare HTTP/2`, Encrypted Auto-Discovery Beacon, and Automatic WebSocket/HTTPS Video Relay Fallback).
 
 ---
 
@@ -11,16 +11,17 @@
 | Server Bind | `0.0.0.0:8787` | Configurable via `PORT` env var |
 | Local HTTP Base | `http://<PC_IP>:8787` | Serves REST API, `/snapshots/*`, and built web client (`web/dist`) |
 | Local WS Endpoint | `ws://<PC_IP>:8787/ws` | JSON text frames (`UTF-8`); USB tunnel: `ws://127.0.0.1:8787/ws` via `adb reverse tcp:8787 tcp:8787` |
-| Remote HTTPS/WSS | `https://<host>` / `wss://<host>/ws` | Cloudflare Quick Tunnel (`*.trycloudflare.com`), Tailscale, or custom reverse proxy. **Never** append `:8787` to `https://` or `wss://` URLs. |
+| Remote HTTPS/WSS | `https://<host>` / `wss://<host>/ws` | `localhost.run` (`*.app.lhr.life`), `Pinggy :443` (`*.free.pinggy.net`), Cloudflare (`*.trycloudflare.com`), Tailscale, or custom reverse proxy. **Never** append `:8787` to `https://` or `wss://` URLs. |
 | Auth Token | `server/data/config.json` / `PURRCAM_TOKEN` | Empty by default for local-only use; auto-generated (192-bit / 32-char URL-safe `base64url`) when starting a remote tunnel if empty. Verified in constant time (`SHA-256` + `timingSafeEqual`). Supplied via `register.token` or `?token=<token>` on WS, and `Authorization: Bearer <token>`, `X-PurrCam-Token: <token>`, or `?token=<token>` on REST. |
 
 ### External vs. Local Security Model
 - A request or WebSocket connection is treated as **external/tunneled** when ANY of the following hold:
-  1. Any proxy header is present (`cf-connecting-ip`, `cf-ray`, `x-forwarded-for`, `forwarded`, `x-real-ip`), **or**
-  2. Remote socket IP is outside loopback (`127.0.0.0/8`, `::1`) and private LAN (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` Tailscale CGNAT, IPv6 ULA/link-local).
+  1. Any proxy header is present (`cf-connecting-ip`, `cf-ray`, `x-forwarded-for`, `x-forwarded-host`, `forwarded`, `x-real-ip`, `via`), **or**
+  2. The `Host` header is NOT `localhost`, `127.0.0.1`, `[::1]`, or a private LAN IPv4 address (protects SSH tunnels such as `localhost.run` / `pinggy` forwarding to `127.0.0.1`), **or**
+  3. Remote socket IP is outside loopback (`127.0.0.0/8`, `::1`) and private LAN (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` Tailscale CGNAT, IPv6 ULA/link-local).
 - **External callers** MUST authenticate with the active `token` on all protected HTTP endpoints and `/ws` (missing/invalid token → HTTP `401 Unauthorized` or WS `error` + close `4001`; repeated auth failures → HTTP `429 Too Many Requests` / WS close `4029`).
 - **Admin & Host-Management Endpoints Are Strictly Local-Only (`403 Forbidden`)**: `GET/PUT /api/remote/config`, `POST /api/remote/start|stop`, `POST /api/system/adb-reverse`, and `GET /api/system/logs` MUST return `403 Forbidden` for any external/tunneled request **even if a valid token is provided**, and omit `Access-Control-Allow-Origin: *`.
-- **Security Headers & Limits**: All HTTP responses include `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`. WS frames are capped at `256 KB` and JSON API bodies at `64 KB`.
+- **Security Headers & Limits**: All HTTP responses include `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`. WS frames are capped at **`1 MB` (`1024 * 1024` bytes)** (supporting `ws_relay` JPEG frames) and JSON API bodies at `64 KB`.
 - Public `GET /api/info` MUST **never** leak `token` or TURN `credential` values.
 
 ### Roles
@@ -136,14 +137,36 @@ export interface IceServerConfig {
 }
 
 export type RemoteTunnelStatus = "stopped" | "starting" | "running" | "error";
-export type RemoteProvider = "cloudflare" | "tailscale" | "custom" | "none";
+export type RemoteProvider =
+  | "auto"
+  | "localhost.run"
+  | "pinggy"
+  | "cloudflare"
+  | "tailscale"
+  | "custom"
+  | "none";
+export type ActiveRemoteProvider =
+  | "localhost.run"
+  | "pinggy"
+  | "cloudflare"
+  | "tailscale"
+  | "custom"
+  | "none";
+
+export interface RemoteBeaconStatus {
+  enabled: boolean;
+  lastPublishedAt: number | null; // Unix epoch ms of last successful encrypted publish
+  endpoints: string[];            // e.g. ["https://ntfy.sh", "https://ntfy.envs.net"]
+}
 
 export interface RemoteStatus {
   enabled: boolean;
   status: RemoteTunnelStatus;
-  provider: RemoteProvider;
-  url: string | null;    // e.g. "https://<slug>.trycloudflare.com"
-  wsUrl: string | null;  // e.g. "wss://<slug>.trycloudflare.com/ws"
+  provider: RemoteProvider;               // Requested mode (e.g. "auto", "localhost.run", "pinggy", ...)
+  activeProvider?: ActiveRemoteProvider;  // Concrete backend currently serving the tunnel
+  url: string | null;                     // e.g. "https://<id>.app.lhr.life"
+  wsUrl: string | null;                   // e.g. "wss://<id>.app.lhr.life/ws"
+  beacon?: RemoteBeaconStatus;            // Encrypted auto-discovery beacon state (v1.2)
   error?: string | null;
 }
 
@@ -421,8 +444,14 @@ Response `200 OK`:
     "enabled": false,
     "status": "stopped",
     "provider": "none",
+    "activeProvider": "none",
     "url": null,
     "wsUrl": null,
+    "beacon": {
+      "enabled": false,
+      "lastPublishedAt": null,
+      "endpoints": ["https://ntfy.sh", "https://ntfy.envs.net"]
+    },
     "error": null
   }
 }
@@ -442,29 +471,37 @@ Response `200 OK`:
     { "urls": "stun:stun1.l.google.com:19302" },
     { "urls": "stun:stun.cloudflare.com:3478" }
   ],
-  "pairingLink": "purrcam://connect?local=ws%3A%2F%2F192.168.1.100%3A8787%2Fws&remote=wss%3A%2F%2Fexample.trycloudflare.com%2Fws&token=example-32-char-url-safe-token-01"
+  "pairingLink": "purrcam://connect?local=ws%3A%2F%2F192.168.1.100%3A8787%2Fws&remote=wss%3A%2F%2Fdemo.app.lhr.life%2Fws&token=example-32-char-url-safe-token-01"
 }
 ```
 
 ### `PUT /api/remote/config` *(Added in v1.1 — Strictly Local LAN/Loopback Only; `403` over Tunnel)*
 Updates any subset of `{ token?, customRemoteUrl?, autoStartTunnel?, iceServers? }`, persists to `server/data/config.json`, and returns the updated `RemoteConfig` (`200 OK`).
 
-### `POST /api/remote/start` *(Added in v1.1 — Strictly Local LAN/Loopback Only; `403` over Tunnel)*
-Starts remote access tunnel (Cloudflare Quick Tunnel via `cloudflared`, auto-downloaded into `server/bin/cloudflared.exe` if absent) or activates a custom remote HTTPS URL. Auto-generates a 192-bit (32-char URL-safe) `token` if none is set, persists it, and broadcasts WS `remote_status` to viewers.
+### `POST /api/remote/start` *(Updated in v1.2 — Strictly Local LAN/Loopback Only; `403` over Tunnel)*
+Starts the remote access tunnel and encrypted auto-discovery beacon. Default `provider` is **`"auto"`** (tries `localhost.run` → `pinggy` `:443` → `cloudflare` `--protocol http2`, with automatic restart & failover watchdog). Auto-generates a 192-bit (32-char URL-safe) `token` if none is set, persists it, publishes the encrypted beacon (§8), and broadcasts WS `remote_status` to viewers.
 
 Request body (optional):
 ```json
-{ "provider": "cloudflare", "customUrl": null }
+{ "provider": "auto", "customUrl": null }
 ```
+Supported `provider` values: `"auto" | "localhost.run" | "pinggy" | "cloudflare" | "tailscale" | "custom"`.
+
 Response `200 OK`:
 ```json
 {
   "remote": {
     "enabled": true,
     "status": "running",
-    "provider": "cloudflare",
-    "url": "https://example.trycloudflare.com",
-    "wsUrl": "wss://example.trycloudflare.com/ws",
+    "provider": "auto",
+    "activeProvider": "localhost.run",
+    "url": "https://demo.app.lhr.life",
+    "wsUrl": "wss://demo.app.lhr.life/ws",
+    "beacon": {
+      "enabled": true,
+      "lastPublishedAt": 1795500000000,
+      "endpoints": ["https://ntfy.sh", "https://ntfy.envs.net"]
+    },
     "error": null
   },
   "token": "example-32-char-url-safe-token-01",
@@ -538,3 +575,127 @@ Both **Web** and **Android** follow **Material 3 Expressive** in English with cl
   - **Web**: 4 focused views (`Live`, `Health`, `Gallery`, `Connect`).
   - **Android Camera Mode**: 3 tabs (`Live`, `Health`, `Settings`).
   - **Android Monitor Mode**: 4 tabs (`Live`, `Device`, `Gallery`, `Settings`).
+
+---
+
+## 7. Always-On Connection Resilience Invariants (v1.2)
+
+- **Server WebSocket Heartbeat Grace**: Server pings every `15s` and tolerates up to **3 consecutive missed ticks (`~45s` grace)** before terminating a peer, preventing spurious drops over 4G/5G or proxied tunnels.
+- **Client Pong & Media Watchdogs**:
+  - Clients track `lastPongTs` (updated on `pong` or any incoming WS frame) and force-reconnect if `> 45s` elapse without activity.
+  - Android Camera & Monitor register `ConnectivityManager.NetworkCallback` to reset backoff and reconnect immediately on Wi-Fi ↔ 4G/5G handoff; Web listens to `visibilitychange` and `online`.
+  - Android Camera ForegroundService uses **only** `camera|microphone` (never `dataSync`, avoiding Android 15–17's 6-hour `DATA_SYNC` OS kill timeout) and restarts Camera2 automatically if no frame arrives for `> 12s`.
+  - Both Android and Web handle WebRTC `ICE DISCONNECTED` (5s grace before recovery), `watch_request` timeout watchdogs, and 10s stalled-frame detection.
+
+---
+
+## 8. Encrypted Zero-Account Auto-Discovery Beacon (v1.2)
+
+When a zero-signup, VPN-free tunnel (`localhost.run`, `pinggy`, `cloudflare`) rotates its public hostname, the PC server publishes the new endpoint encrypted end-to-end with the user's shared `token` to redundant, non-Cloudflare `ntfy` relays (`https://ntfy.sh` and `https://ntfy.envs.net`). Paired Android and Web monitors automatically fetch and decrypt the latest URL without any account, VPS, or re-pairing.
+
+### 8.1 Exact Cryptographic Specification
+Identical byte-for-byte across **Node.js `node:crypto`**, **Java/Kotlin `javax.crypto.Cipher`**, and **Browser `WebCrypto`**:
+
+1. **Key & Topic Derivation** (UTF-8 string concatenation + SHA-256):
+   - `topicId = "purrcam-" + hex(SHA256(utf8("purrcam:beacon:topic:v1:" + token))).slice(0, 32)`
+     *(40 characters total: `"purrcam-"` + 32 lowercase hex characters.)*
+   - `aesKey = SHA256(utf8("purrcam:beacon:aes256:v1:" + token))`
+     *(32 raw bytes = AES-256-GCM key.)*
+2. **Plaintext Payload** (UTF-8 JSON):
+   ```json
+   {
+     "v": 1,
+     "url": "https://demo.app.lhr.life",
+     "wsUrl": "wss://demo.app.lhr.life/ws",
+     "provider": "localhost.run",
+     "ts": 1795500000000
+   }
+   ```
+3. **Encryption (AES-256-GCM)**:
+   - Generate a fresh random **12-byte** `iv` (`96 bits`).
+   - Encrypt UTF-8 plaintext with `aesKey` and `iv`, **no AAD** (`additionalAuthenticatedData` empty/omitted), **16-byte (`128-bit`) authentication tag**.
+   - Concatenate `combined = ciphertext || authTag` (tag directly appended at the end — matches Java `Cipher("AES/GCM/NoPadding")` and WebCrypto `AES-GCM` output directly; in Node `crypto`, append `cipher.getAuthTag()`).
+4. **Published Envelope** (UTF-8 JSON string):
+   ```json
+   {
+     "v": 1,
+     "iv": "<standard-base64-of-12-byte-iv>",
+     "ct": "<standard-base64-of-ciphertext-plus-16B-tag>"
+   }
+   ```
+
+### 8.2 Publishing & Polling Endpoints
+- **Server Publish** (on every tunnel startup / URL rotation + every **10 minutes** keepalive to keep `ntfy`'s 12-hour cache warm indefinitely):
+  - `POST https://ntfy.sh/<topicId>`
+  - `POST https://ntfy.envs.net/<topicId>`
+  - Headers: `Content-Type: text/plain`, `X-Cache: yes`
+  - Body: the Published Envelope JSON string above.
+- **Client Poll** (triggered automatically after 2 failed Remote WS attempts or HTTP `404`/`502`/`503`/`52x` expired tunnel):
+  - `GET https://ntfy.sh/<topicId>/json?poll=1&since=all`
+  - `GET https://ntfy.envs.net/<topicId>/json?poll=1&since=all`
+  - Parse newline-delimited JSON (`NDJSON`); for every line where `event === "message"`, parse `message` as the Encrypted Envelope JSON and attempt AES-256-GCM decryption (ignoring malformed/corrupt/wrong-key lines).
+  - Validate decrypted JSON has `v === 1`, `typeof ts === "number"`, `url.startsWith("https://")`, and `wsUrl.startsWith("wss://")`.
+  - Select the valid entry with the **highest `ts`**, persist the new `remoteServerUrl`, and reconnect seamlessly.
+
+### 8.3 Reference Interoperability Test Vector
+Implementations SHOULD verify byte-for-byte parity using this exact vector:
+
+| Field | Value |
+| --- | --- |
+| `token` | `purrcam-test-vector-token-v1` |
+| `topicId` | `purrcam-a793ba5e2ec528be44b8c7169f47de2d` |
+| `aesKey` (hex) | `9d3bda26da32402321f85d3c892ef16b1a2b0ebcc21b6842c7b8a36026c1eeea` |
+| `iv` (hex / base64) | `0102030405060708090a0b0c` / `AQIDBAUGBwgJCgsM` |
+| `plaintext` | `{"v":1,"url":"https://demo.app.lhr.life","wsUrl":"wss://demo.app.lhr.life/ws","provider":"localhost.run","ts":1795500000000}` |
+| `envelope` | `{"v":1,"iv":"AQIDBAUGBwgJCgsM","ct":"makxxxrVCdpbHF1dzommR5+Bzaej6iOtNkMXQzrV0M8Rgtkosyq7lOK1ENcS18T4qFASC4aWlqgXvNNv/cyS7kehKARzrygL4Fdu/b0HxJ7nj1zD7fNvMU7rPhbiZOX6RgDBFhtvuWTJgYOkeCnxTs0Rr/OVmB2OnsMgzWlESBdP2lBL/l5/Onl7sEk="}` |
+
+---
+
+## 9. Automatic WebSocket / HTTPS Video Relay Fallback (`ws_relay`, v1.2)
+
+When a viewer is behind strict 4G/5G symmetric CGNAT or a firewall blocking WebRTC UDP (without TURN or VPN), PurrCam automatically falls back to relaying upright JPEG video frames over the existing **TCP 443 HTTPS/WSS** tunnel.
+
+### 9.1 Messages
+
+#### `stream_mode` (Viewer → Server → Camera)
+Requests switching a viewer between `"webrtc"` (default) and `"ws_relay"`.
+```json
+{
+  "type": "stream_mode",
+  "viewerId": "web-8f3a1b",
+  "mode": "ws_relay",
+  "fps": 8,
+  "quality": 60
+}
+```
+- `viewerId`: optional from viewer; the server MUST stamp/overwrite `viewerId` with the sender's registered viewer ID before forwarding to the camera.
+- `mode`: `"webrtc" | "ws_relay"`.
+- `fps` (optional, default `8`) & `quality` (optional JPEG quality `1..100`, default `60`): hints for the camera's relay encoder.
+- **Lifecycle**: Server tracks `viewer.streamMode` per viewer. When a `ws_relay` viewer disconnects or sends `watch_stop`, the server notifies the camera (`{ "type": "stream_mode", "viewerId": "...", "mode": "webrtc" }` + `viewer_left`) so the camera immediately detaches its JPEG encoder (`0%` CPU overhead when zero relay viewers remain).
+
+#### `video_frame` (Camera → Server → `ws_relay` Viewers Only)
+```json
+{
+  "type": "video_frame",
+  "ts": 1795500001250,
+  "width": 540,
+  "height": 960,
+  "lensLabel": "0.6× Wide",
+  "mime": "image/jpeg",
+  "data": "<standard-base64-jpeg>"
+}
+```
+- Camera applies `VideoFrame.rotation` before JPEG encoding so frames are always upright and un-squished (typically throttled to ~8 fps, short edge ≤ 540 px, quality ~60).
+- Server forwards `video_frame` **ONLY** to viewers currently in `streamMode === "ws_relay"`.
+
+### 9.2 Backpressure & Payload Limits
+- **Camera outbound guard**: Skip encoding/sending a frame if `webSocket.queueSize() > 262_144` (`256 KB`).
+- **Server per-viewer guard**: Skip sending a `video_frame` to any viewer whose `ws.bufferedAmount > 524_288` (`512 KB`) to prevent latency buildup on slow cellular links.
+- **Server WS `maxPayload`**: **`1_048_576` bytes (`1 MB`)**.
+
+### 9.3 Client Auto-Fallback Behavior
+- Clients expose stream mode preference: **`Auto`** (default), **`WebRTC`**, **`HTTPS Relay`**.
+- In **`Auto`** mode:
+  1. Start with low-latency **WebRTC** (`watch_request`).
+  2. If WebRTC does not deliver decoded video frames within **6 seconds** (or enters `ICE FAILED` / `DISCONNECTED` > 5s / stalled frames > 10s), automatically send `{ "type": "stream_mode", "mode": "ws_relay" }` and render incoming `video_frame` images seamlessly with a **`LIVE · HTTPS Relay`** indicator.
+  3. On Local LAN, prefer WebRTC (falling back to `ws_relay` only if WebRTC fails).

@@ -40,8 +40,11 @@ import {
   type CatSoundType,
   type CommandAction,
   type CommandPayloads,
+  type RelayVideoFrame,
   type RtcConnectionStatus,
   type SnapshotMeta,
+  type StreamMode,
+  type StreamModePreference,
   type Telemetry,
   type VideoResolution,
   type WebRtcLiveStats,
@@ -53,6 +56,10 @@ import { M3ConnectedButtonGroup, M3Slider } from './M3Controls';
 interface LiveViewProps {
   wsStatus: WsConnectionStatus;
   rtcStatus: RtcConnectionStatus;
+  streamModePreference: StreamModePreference;
+  activeStreamMode: StreamMode;
+  onSetStreamModePreference: (pref: StreamModePreference) => void;
+  relayFrame: RelayVideoFrame | null;
   cameraOnline: boolean;
   camera: CameraSummary | null;
   telemetry: Telemetry | null;
@@ -106,6 +113,10 @@ function pickRecorderMimeType(): string {
 export function LiveView({
   wsStatus,
   rtcStatus,
+  streamModePreference,
+  activeStreamMode,
+  onSetStreamModePreference,
+  relayFrame,
   cameraOnline,
   camera,
   telemetry,
@@ -266,8 +277,13 @@ export function LiveView({
     [clampPan]
   );
 
+  const isRelayMode = activeStreamMode === 'ws_relay';
+  const hasRelayVideo = Boolean(isRelayMode && relayFrame && cameraOnline);
+  const hasWebRtcVideo = Boolean(!isRelayMode && remoteStream && cameraOnline);
+  const hasAnyVideo = hasWebRtcVideo || hasRelayVideo;
+
   const handleWheel = (e: ReactWheelEvent<HTMLDivElement>) => {
-    if (!remoteStream) return;
+    if (!hasAnyVideo) return;
     if ((e.target as HTMLElement).closest('[data-tune-sheet]')) return;
     e.preventDefault();
     bumpHud();
@@ -299,7 +315,7 @@ export function LiveView({
   };
 
   const handleDoubleClick = (e: ReactMouseEvent<HTMLDivElement>) => {
-    if (!remoteStream) return;
+    if (!hasAnyVideo) return;
     if ((e.target as HTMLElement).closest('button, input, a, [data-tune-sheet]')) return;
     updateDigitalZoom(digitalZoom > 1.05 ? 1 : 2);
   };
@@ -386,6 +402,35 @@ export function LiveView({
 
   const handleSnapshot = async () => {
     if (capturingSnapshot) return;
+
+    // Instant snapshot in HTTPS Relay mode: upload current JPEG frame directly
+    if (isRelayMode && relayFrame?.base64) {
+      setCapturingSnapshot(true);
+      try {
+        const binary = atob(relayFrame.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: relayFrame.mime || 'image/jpeg' });
+        const meta = await uploadSnapshotBlob(
+          serverUrl,
+          blob,
+          activeLens ? formatLensLabel(activeLens) : relayFrame.lensLabel ?? undefined,
+          token
+        );
+        onSnapshotUploaded(meta);
+      } catch (err) {
+        if (cameraOnline) {
+          onSendCommand('request_snapshot', {});
+          onNotify('info', 'Requested HD snapshot from Poco F3');
+        } else {
+          onNotify('error', err instanceof Error ? err.message : 'Failed to save snapshot');
+        }
+      } finally {
+        setCapturingSnapshot(false);
+      }
+      return;
+    }
+
     const video = videoRef.current;
 
     if (!video || !remoteStream || video.videoWidth === 0 || video.videoHeight === 0) {
@@ -480,12 +525,12 @@ export function LiveView({
 
   const sendSound = (sound: CatSoundType) => onSendCommand('play_sound', { sound });
 
-  const hasVideo = Boolean(remoteStream && cameraOnline);
+  const hasVideo = hasAnyVideo;
   const showOverlay =
     hudVisible ||
     hudPinned ||
     tuneOpen ||
-    !remoteStream ||
+    !hasAnyVideo ||
     talkbackActive ||
     isRecording ||
     rtcStatus !== 'live';
@@ -511,7 +556,7 @@ export function LiveView({
           isFullscreen ? 'rounded-none' : 'rounded-[36px]'
         } ${digitalZoom > 1.01 ? 'cursor-grab active:cursor-grabbing' : ''}`}
       >
-        {/* Stream Video Element — ALWAYS preserves aspect ratio (`object-contain` default, toggleable to `object-cover`) */}
+        {/* WebRTC Video Element — ALWAYS preserves aspect ratio (`object-contain` default, toggleable to `object-cover`) */}
         <video
           ref={videoRef}
           autoPlay
@@ -525,8 +570,26 @@ export function LiveView({
           }}
           className={`h-full w-full will-change-transform ${
             fitMode === 'cover' ? 'object-cover' : 'object-contain'
-          } ${hasVideo ? 'opacity-100' : 'opacity-0'}`}
+          } ${hasWebRtcVideo ? 'opacity-100' : 'hidden'}`}
         />
+
+        {/* HTTPS / WebSocket Video Relay Frame Renderer (Protocol v1.2 §9 — Zero-UDP 4G/5G fallback) */}
+        {hasRelayVideo && relayFrame && (
+          <img
+            src={relayFrame.dataUrl}
+            alt="Live HTTPS Relay stream"
+            draggable={false}
+            style={{
+              transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${digitalZoom})`,
+              transition: dragRef.current.dragging
+                ? 'none'
+                : 'transform 180ms cubic-bezier(0.22, 1, 0.36, 1)',
+            }}
+            className={`h-full w-full will-change-transform ${
+              fitMode === 'cover' ? 'object-cover' : 'object-contain'
+            }`}
+          />
+        )}
 
         {/* Calm M3 Expressive Standby State when Camera is Offline */}
         {!cameraOnline && (
@@ -577,7 +640,7 @@ export function LiveView({
 
         {/* Reconnecting / Handshake Overlay */}
         {cameraOnline &&
-          (!remoteStream ||
+          (!hasAnyVideo ||
             rtcStatus === 'requesting' ||
             rtcStatus === 'connecting' ||
             rtcStatus === 'reconnecting') && (
@@ -595,9 +658,11 @@ export function LiveView({
                     style={{ color: 'var(--md-sys-color-on-surface)' }}
                     className="text-sm font-semibold"
                   >
-                    {rtcStatus === 'reconnecting'
-                      ? 'Reconnecting stream…'
-                      : 'Starting live video…'}
+                    {isRelayMode
+                      ? 'Connecting HTTPS Relay…'
+                      : rtcStatus === 'reconnecting'
+                        ? 'Reconnecting stream…'
+                        : 'Starting live video…'}
                   </p>
                   <p
                     style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
@@ -659,26 +724,40 @@ export function LiveView({
                           : 'var(--md-sys-color-warn)',
                     }}
                   >
-                    {rtcStatus === 'live' ? 'LIVE' : 'SYNC'}
+                    {rtcStatus === 'live'
+                      ? isRelayMode
+                        ? 'LIVE · HTTPS Relay'
+                        : 'LIVE'
+                      : isRelayMode
+                        ? 'RELAY'
+                        : 'SYNC'}
                   </span>
                 </span>
 
-                {rtcStats && rtcStats.width > 0 && (
+                {isRelayMode && relayFrame ? (
                   <>
                     <span className="opacity-40">·</span>
-                    <span className="font-mono tabular-nums">{rtcStats.fps} fps</span>
-                    {rtcStats.rttMs !== null && (
-                      <>
-                        <span className="opacity-40">·</span>
-                        <span
-                          style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                          className="font-mono tabular-nums"
-                        >
-                          {rtcStats.rttMs} ms
-                        </span>
-                      </>
-                    )}
+                    <span className="font-mono tabular-nums">{relayFrame.fps} fps</span>
                   </>
+                ) : (
+                  rtcStats &&
+                  rtcStats.width > 0 && (
+                    <>
+                      <span className="opacity-40">·</span>
+                      <span className="font-mono tabular-nums">{rtcStats.fps} fps</span>
+                      {rtcStats.rttMs !== null && (
+                        <>
+                          <span className="opacity-40">·</span>
+                          <span
+                            style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                            className="font-mono tabular-nums"
+                          >
+                            {rtcStats.rttMs} ms
+                          </span>
+                        </>
+                      )}
+                    </>
+                  )
                 )}
 
                 {telemetry && typeof telemetry.batteryPct === 'number' && (
@@ -781,7 +860,7 @@ export function LiveView({
               </button>
               <button
                 type="button"
-                disabled={!hasVideo}
+                disabled={!hasWebRtcVideo}
                 onClick={() => void togglePip()}
                 title="Picture-in-Picture"
                 data-active={isPip}
@@ -1063,11 +1142,30 @@ export function LiveView({
                   </div>
                 </div>
 
-                {/* Video Profile — M3 Connected Button Groups */}
+                {/* Stream Transport + Video Profile — M3 Connected Button Groups */}
                 <div
                   style={{ backgroundColor: 'var(--md-sys-color-surface-container-low)' }}
                   className="mt-4 space-y-2.5 rounded-[24px] p-3.5"
                 >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span
+                      style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                      className="text-xs font-semibold"
+                    >
+                      Stream
+                    </span>
+                    <M3ConnectedButtonGroup<StreamModePreference>
+                      size="sm"
+                      value={streamModePreference}
+                      onChange={onSetStreamModePreference}
+                      options={[
+                        { value: 'auto', label: 'Auto' },
+                        { value: 'webrtc', label: 'WebRTC' },
+                        { value: 'ws_relay', label: 'HTTPS Relay' },
+                      ]}
+                    />
+                  </div>
+
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <span
                       style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
@@ -1213,9 +1311,13 @@ export function LiveView({
               <button
                 type="button"
                 data-active="true"
-                disabled={!hasVideo || talkbackBusy}
+                disabled={!hasWebRtcVideo || talkbackBusy}
                 onClick={() => void onSetTalkback(!talkbackActive)}
-                title="Talk through Poco F3 speaker"
+                title={
+                  isRelayMode
+                    ? 'Switch to WebRTC in Tune for two-way Talkback'
+                    : 'Talk through Poco F3 speaker'
+                }
                 style={{
                   backgroundColor: talkbackActive
                     ? 'var(--md-sys-color-primary)'
@@ -1239,17 +1341,17 @@ export function LiveView({
               {/* Audio Listen */}
               <button
                 type="button"
-                data-active={!muted && hasVideo}
-                disabled={!hasVideo}
+                data-active={!muted && hasWebRtcVideo}
+                disabled={!hasWebRtcVideo}
                 onClick={() => setMuted((m) => !m)}
                 title={muted ? 'Unmute camera audio' : 'Mute audio'}
                 style={{
                   backgroundColor:
-                    !muted && hasVideo
+                    !muted && hasWebRtcVideo
                       ? 'var(--md-sys-color-secondary-container)'
                       : 'var(--md-sys-color-surface-container)',
                   color:
-                    !muted && hasVideo
+                    !muted && hasWebRtcVideo
                       ? 'var(--md-sys-color-on-secondary-container)'
                       : 'var(--md-sys-color-on-surface)',
                 }}
@@ -1286,9 +1388,15 @@ export function LiveView({
               <button
                 type="button"
                 data-active={isRecording}
-                disabled={!hasVideo && !isRecording}
+                disabled={!hasWebRtcVideo && !isRecording}
                 onClick={toggleRecording}
-                title={isRecording ? 'Stop recording (.webm)' : 'Record video locally (.webm)'}
+                title={
+                  isRecording
+                    ? 'Stop recording (.webm)'
+                    : isRelayMode
+                      ? 'Switch to WebRTC in Tune to record .webm video'
+                      : 'Record video locally (.webm)'
+                }
                 style={{
                   backgroundColor: isRecording
                     ? 'var(--md-sys-color-error-container)'

@@ -76,7 +76,7 @@ if (-not (Test-ServerReady -TargetPort $Port)) {
   $env:PORT = "$Port"
   if ($Remote) {
     $env:PURRCAM_REMOTE = "1"
-    Write-Host "[PurrCam] Remote Access (Cloudflare Quick Tunnel) enabled." -ForegroundColor Cyan
+    Write-Host "[PurrCam] Auto VPN-Free Remote Access Tunnel enabled." -ForegroundColor Cyan
   }
   Start-Process -FilePath "node" `
     -ArgumentList "dist\index.js" `

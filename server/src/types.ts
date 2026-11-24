@@ -6,7 +6,29 @@ export type VideoResolution = "480p" | "720p" | "1080p";
 export type ChargeSource = "ac" | "usb" | "wireless" | "none";
 
 export type RemoteTunnelStatus = "stopped" | "starting" | "running" | "error";
-export type RemoteProvider = "cloudflare" | "tailscale" | "custom" | "none";
+export type RemoteProvider =
+  | "auto"
+  | "localhost.run"
+  | "pinggy"
+  | "cloudflare"
+  | "tailscale"
+  | "custom"
+  | "none";
+export type ActiveRemoteProvider =
+  | "localhost.run"
+  | "pinggy"
+  | "cloudflare"
+  | "tailscale"
+  | "custom"
+  | "none";
+
+export type StreamMode = "webrtc" | "ws_relay";
+
+export interface BeaconStatus {
+  enabled: boolean;
+  lastPublishedAt: number | null;
+  endpoints: string[];
+}
 
 export interface IceServerConfig {
   urls: string | string[];
@@ -18,9 +40,11 @@ export interface RemoteStatus {
   enabled: boolean;
   status: RemoteTunnelStatus;
   provider: RemoteProvider;
+  activeProvider: ActiveRemoteProvider;
   url: string | null;
   wsUrl: string | null;
   error?: string | null;
+  beacon: BeaconStatus;
 }
 
 export interface PersistedConfig {
@@ -171,6 +195,24 @@ export interface WatchStopMessage {
   viewerId?: string;
 }
 
+export interface StreamModeMessage {
+  type: "stream_mode";
+  viewerId?: string;
+  mode: StreamMode;
+  fps?: number;
+  quality?: number;
+}
+
+export interface VideoFrameMessage {
+  type: "video_frame";
+  ts: number;
+  width: number;
+  height: number;
+  lensLabel?: string;
+  mime: string;
+  data: string;
+}
+
 export interface RtcOfferMessage {
   type: "rtc_offer";
   viewerId: string;
@@ -301,8 +343,10 @@ export interface ServerConfig {
   maxTelemetrySamples: number;
   telemetryFlushIntervalMs: number;
   heartbeatIntervalMs: number;
+  heartbeatMaxMissed: number;
   registerTimeoutMs: number;
   maxSnapshotBytes: number;
   authRateLimitMaxFailures: number;
   authRateLimitWindowMs: number;
+  enableBeacon: boolean;
 }

@@ -33,7 +33,7 @@ async function main(): Promise<void> {
   );
   console.log(`   TURN      : ${turnActive ? "configured" : "STUN only"}`);
   console.log(
-    `   Remote    : ${remoteAuto ? "starting Cloudflare Quick Tunnel..." : "stopped (start via Connect tab or POST /api/remote/start)"}`
+    `   Remote    : ${remoteAuto ? "starting Auto Remote Tunnel (No VPN)..." : "stopped (start via Connect tab or POST /api/remote/start)"}`
   );
   console.log(`   Data Dir  : ${server.config.dataDir}`);
   console.log(`   Web Dist  : ${server.config.webDistDir}`);
